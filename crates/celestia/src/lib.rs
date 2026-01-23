@@ -9,6 +9,7 @@ mod client;
 mod error;
 mod finality;
 mod index;
+mod retry;
 
 pub use client::CelestiaClient;
 pub use index::{BlockIndex, IndexEntry};

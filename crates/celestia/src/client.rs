@@ -17,14 +17,10 @@ use sequencer_types::{Block, CelestiaConfig};
 use tendermint::merkle;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
+use crate::retry::{with_retry, DEFAULT_MAX_RETRIES, DEFAULT_RECONNECT_DELAY_MS, DEFAULT_RETRY_DELAY_MS};
 use crate::{
     BlobSubmission, CelestiaError, DataAvailability, FinalityConfirmation, FinalityTracker, Result,
 };
-
-/// Default retry configuration.
-const DEFAULT_MAX_RETRIES: u32 = 3;
-const DEFAULT_RETRY_DELAY_MS: u64 = 1000;
-const DEFAULT_RECONNECT_DELAY_MS: u64 = 5000;
 
 /// Celestia DA client.
 ///
@@ -188,46 +184,33 @@ impl CelestiaClient {
 
     /// Submit a blob with retry logic using Lumina client (gRPC).
     async fn submit_with_retry(&self, blob: Blob) -> Result<(u64, Vec<u8>)> {
-        let mut attempts = 0;
-        let max_retries = DEFAULT_MAX_RETRIES;
         let commitment = Self::commitment_to_bytes(blob.commitment.into());
+        let gas_price = self.config.gas_price;
+        let client = &self.lumina_client;
 
-        loop {
-            attempts += 1;
+        let height = with_retry(
+            "Blob submission",
+            DEFAULT_MAX_RETRIES,
+            DEFAULT_RETRY_DELAY_MS,
+            || async {
+                let tx_config = TxConfig::default().with_gas_price(gas_price);
+                let tx_info = client
+                    .blob()
+                    .submit(std::slice::from_ref(&blob), tx_config)
+                    .await?;
 
-            // Configure transaction with gas price from config
-            let tx_config = TxConfig::default().with_gas_price(self.config.gas_price);
+                tracing::debug!(
+                    height = tx_info.height,
+                    tx_hash = %hex::encode(tx_info.hash),
+                    "Blob submitted via gRPC"
+                );
 
-            match self.lumina_client.blob().submit(std::slice::from_ref(&blob), tx_config).await {
-                Ok(tx_info) => {
-                    tracing::debug!(
-                        height = tx_info.height,
-                        tx_hash = %hex::encode(tx_info.hash),
-                        "Blob submitted via gRPC"
-                    );
-                    return Ok((tx_info.height, commitment));
-                }
-                Err(e) => {
-                    if attempts >= max_retries {
-                        return Err(CelestiaError::SubmissionFailed(format!(
-                            "failed after {attempts} attempts: {e}"
-                        )));
-                    }
+                Ok::<_, celestia_client::Error>(tx_info.height)
+            },
+        )
+        .await?;
 
-                    tracing::warn!(
-                        attempt = attempts,
-                        max_retries,
-                        error = %e,
-                        "Blob submission failed, retrying..."
-                    );
-
-                    tokio::time::sleep(Duration::from_millis(
-                        DEFAULT_RETRY_DELAY_MS * u64::from(attempts),
-                    ))
-                    .await;
-                }
-            }
-        }
+        Ok((height, commitment))
     }
 
     /// Run the finality tracking loop with automatic reconnection.
@@ -261,62 +244,70 @@ impl CelestiaClient {
 
         let mut header_sub = self.rpc_client.header_subscribe();
 
-        loop {
-            match header_sub.next().await {
-                Some(Ok(header)) => {
-                    let celestia_height = header.height();
-                    let celestia_hash = header.hash();
-
-                    // Convert Celestia hash to B256
-                    // Celestia hashes are always 32 bytes (SHA256), so this should never fail
-                    let hash_bytes: [u8; 32] = celestia_hash
-                        .as_bytes()
-                        .try_into()
-                        .expect("Celestia header hash is always 32 bytes");
-                    let header_hash = B256::from(hash_bytes);
-
-                    tracing::debug!(
-                        celestia_height,
-                        %header_hash,
-                        "Received Celestia header"
-                    );
-
-                    // Check for finalized blocks
-                    let confirmations = {
-                        let mut tracker = self.finality_tracker.write().await;
-                        tracker.on_celestia_finality(celestia_height, header_hash)
-                    };
-
-                    // Send finality confirmations
-                    for confirmation in confirmations {
-                        tracing::info!(
-                            block_height = confirmation.block_height,
-                            celestia_height = confirmation.celestia_height,
-                            latency_ms = confirmation.latency_ms(),
-                            "Block finalized on Celestia"
-                        );
-
-                        // Send to main channel
-                        if self.finality_tx.send(confirmation.clone()).await.is_err() {
-                            tracing::warn!("Finality receiver dropped");
-                        }
-
-                        // Broadcast to all subscribers (ignore errors - no receivers is OK)
-                        let _ = self.finality_broadcast.send(confirmation);
-                    }
-                }
-                Some(Err(e)) => {
+        while let Some(result) = header_sub.next().await {
+            match result {
+                Ok(header) => self.process_header(&header).await?,
+                Err(e) => {
                     tracing::error!(error = %e, "Header subscription error");
                     return Err(CelestiaError::SubscriptionFailed(e.to_string()));
                 }
-                None => {
-                    tracing::warn!("Header subscription ended unexpectedly");
-                    return Err(CelestiaError::SubscriptionFailed(
-                        "subscription stream ended".to_string(),
-                    ));
-                }
             }
         }
+
+        tracing::warn!("Header subscription ended unexpectedly");
+        Err(CelestiaError::SubscriptionFailed(
+            "subscription stream ended".to_string(),
+        ))
+    }
+
+    /// Process a single Celestia header.
+    async fn process_header(&self, header: &celestia_types::ExtendedHeader) -> Result<()> {
+        let celestia_height = header.height();
+        let header_hash = Self::header_to_b256(header);
+
+        tracing::debug!(
+            celestia_height,
+            %header_hash,
+            "Received Celestia header"
+        );
+
+        let confirmations = {
+            let mut tracker = self.finality_tracker.write().await;
+            tracker.on_celestia_finality(celestia_height, header_hash)
+        };
+
+        self.broadcast_confirmations(confirmations).await;
+        Ok(())
+    }
+
+    /// Broadcast finality confirmations to all subscribers.
+    async fn broadcast_confirmations(&self, confirmations: Vec<FinalityConfirmation>) {
+        for confirmation in confirmations {
+            tracing::info!(
+                block_height = confirmation.block_height,
+                celestia_height = confirmation.celestia_height,
+                latency_ms = confirmation.latency_ms(),
+                "Block finalized on Celestia"
+            );
+
+            // Send to main channel
+            if self.finality_tx.send(confirmation.clone()).await.is_err() {
+                tracing::warn!("Finality receiver dropped");
+            }
+
+            // Broadcast to all subscribers (ignore errors - no receivers is OK)
+            let _ = self.finality_broadcast.send(confirmation);
+        }
+    }
+
+    /// Convert a Celestia header hash to B256.
+    fn header_to_b256(header: &celestia_types::ExtendedHeader) -> B256 {
+        let hash_bytes: [u8; 32] = header
+            .hash()
+            .as_bytes()
+            .try_into()
+            .expect("Celestia header hash is always 32 bytes");
+        B256::from(hash_bytes)
     }
 
     /// Get a block from Celestia by height.
@@ -545,46 +536,30 @@ impl CelestiaClient {
             block_infos.push((block.block_hash, block.height()));
         }
 
-        // Submit all blobs in one transaction
-        let tx_config = TxConfig::default().with_gas_price(self.config.gas_price);
+        // Submit all blobs in one transaction with retry
+        let gas_price = self.config.gas_price;
+        let client = &self.lumina_client;
+        let block_count = blobs.len();
 
-        let mut attempts = 0;
-        let max_retries = DEFAULT_MAX_RETRIES;
+        let celestia_height = with_retry(
+            "Batch submission",
+            DEFAULT_MAX_RETRIES,
+            DEFAULT_RETRY_DELAY_MS,
+            || async {
+                let tx_config = TxConfig::default().with_gas_price(gas_price);
+                let tx_info = client.blob().submit(&blobs, tx_config).await?;
 
-        let celestia_height = loop {
-            attempts += 1;
+                tracing::info!(
+                    height = tx_info.height,
+                    tx_hash = %hex::encode(tx_info.hash),
+                    block_count,
+                    "Block batch submitted to Celestia"
+                );
 
-            match self.lumina_client.blob().submit(&blobs, tx_config.clone()).await {
-                Ok(tx_info) => {
-                    tracing::info!(
-                        height = tx_info.height,
-                        tx_hash = %hex::encode(tx_info.hash),
-                        block_count = blobs.len(),
-                        "Block batch submitted to Celestia"
-                    );
-                    break tx_info.height;
-                }
-                Err(e) => {
-                    if attempts >= max_retries {
-                        return Err(CelestiaError::SubmissionFailed(format!(
-                            "batch submission failed after {attempts} attempts: {e}"
-                        )));
-                    }
-
-                    tracing::warn!(
-                        attempt = attempts,
-                        max_retries,
-                        error = %e,
-                        "Batch submission failed, retrying..."
-                    );
-
-                    tokio::time::sleep(Duration::from_millis(
-                        DEFAULT_RETRY_DELAY_MS * u64::from(attempts),
-                    ))
-                    .await;
-                }
-            }
-        };
+                Ok::<_, celestia_client::Error>(tx_info.height)
+            },
+        )
+        .await?;
 
         // Build submission results
         let submissions: Vec<BlobSubmission> = block_infos
