@@ -99,7 +99,7 @@ pub fn default_config() -> Config {
             leader_timeout_ms: 2000,
             notarization_timeout_ms: 3000,
             nullify_retry_ms: 10000,
-            namespace: "astria-sequencer".to_string(),
+            namespace: "rkb-sequencer".to_string(),
             storage_dir: "./consensus-data".into(),
             allow_private_ips: true,
         },
@@ -111,7 +111,7 @@ pub fn default_config() -> Config {
             core_grpc_auth_token: String::new(),
             core_grpc_tls_enabled: false,
             celestia_key_path: "celestia.key".into(),
-            namespace: "617374726961".to_string(), // "astria" in hex (auto-padded by Celestia)
+            namespace: "726b62".to_string(), // "rkb" in hex (auto-padded by Celestia)
             gas_price: 0.002,
             batch_interval_ms: 5000,       // 5 seconds
             max_batch_size_bytes: 1_500_000, // 1.5MB

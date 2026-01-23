@@ -58,7 +58,7 @@ pub mod defaults {
     /// Default application namespace.
     #[must_use]
     pub fn namespace() -> String {
-        "astria-sequencer".to_string()
+        "rkb-sequencer".to_string()
     }
 }
 

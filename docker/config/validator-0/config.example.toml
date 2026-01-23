@@ -29,7 +29,7 @@ notarization_timeout_ms = 3000
 nullify_retry_ms = 10000
 
 # Namespace for signing
-namespace = "astria-sequencer"
+namespace = "rkb-sequencer"
 
 # Storage
 storage_dir = "/data/consensus"
@@ -56,8 +56,8 @@ core_grpc_tls_enabled = true
 celestia_key_path = "/keys/celestia.key"
 
 # Namespace (hex-encoded suffix, max 10 bytes - auto-padded by Celestia)
-# "astria" in hex = 617374726961
-namespace = "617374726961"
+# "rkb" in hex = 726b62
+namespace = "726b62"
 
 # Gas price
 gas_price = 0.04
