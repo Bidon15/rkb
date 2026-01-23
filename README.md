@@ -1,6 +1,6 @@
-# Astria Sequencer
+# RKB (Rauh-Konsens Begriff)
 
-A Celestia-native PoA EVM sequencer. Minimal coordination layer wiring battle-tested components.
+A Celestia-native PoA EVM sequencer. Minimal coordination layer wiring known components.
 
 ```
 Reth      → EVM execution, mempool, block building
@@ -12,14 +12,14 @@ Celestia  → Data availability, firm finality
 
 This project maintains minimal code by delegating to proven systems:
 
-| Responsibility | Delegated To | Our Code |
-|---------------|--------------|----------|
-| Transaction ordering | reth mempool | 0 lines |
-| Block building | reth Engine API | ~50 lines |
-| EVM execution | reth | 0 lines |
-| BFT consensus | commonware-consensus | ~200 lines glue |
-| Data availability | Celestia | ~300 lines client |
-| P2P networking | commonware-p2p | ~100 lines config |
+| Responsibility       | Delegated To         | Our Code          |
+| -------------------- | -------------------- | ----------------- |
+| Transaction ordering | reth mempool         | 0 lines           |
+| Block building       | reth Engine API      | ~50 lines         |
+| EVM execution        | reth                 | 0 lines           |
+| BFT consensus        | commonware-consensus | ~200 lines glue   |
+| Data availability    | Celestia             | ~300 lines client |
+| P2P networking       | commonware-p2p       | ~100 lines config |
 
 **Total: ~3,000 lines of Rust** orchestrating components with millions of lines of battle-tested code.
 
@@ -71,10 +71,10 @@ User Transactions ──► reth mempool ──► reth builds block
 
 ## Finality Model
 
-| Level | Trigger | Latency | Guarantee |
-|-------|---------|---------|-----------|
-| **Soft** | 2/3 BFT notarization | ~200ms | PoA validators agreed |
-| **Firm** | Celestia blob inclusion | ~6s | Data availability proven |
+| Level    | Trigger                 | Latency | Guarantee                |
+| -------- | ----------------------- | ------- | ------------------------ |
+| **Soft** | 2/3 BFT notarization    | ~200ms  | PoA validators agreed    |
+| **Firm** | Celestia blob inclusion | ~6s     | Data availability proven |
 
 ## Project Structure
 
@@ -102,13 +102,13 @@ We write none of the complex parts. reth handles EVM. Celestia handles DA. commo
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [CLAUDE.md](CLAUDE.md) | AI assistant context, crate map, troubleshooting |
-| [Architecture](docs/architecture.md) | Data flow diagrams, design decisions |
-| [Onboarding](docs/onboarding.md) | Sequence diagrams, component responsibilities |
-| [Running 3-Validator Network](docs/running-3-validator-network.md) | Docker setup guide |
-| [Docker README](docker/README.md) | Quick start for local testing |
+| Document                                                           | Description                                      |
+| ------------------------------------------------------------------ | ------------------------------------------------ |
+| [CLAUDE.md](CLAUDE.md)                                             | AI assistant context, crate map, troubleshooting |
+| [Architecture](docs/architecture.md)                               | Data flow diagrams, design decisions             |
+| [Onboarding](docs/onboarding.md)                                   | Sequence diagrams, component responsibilities    |
+| [Running 3-Validator Network](docs/running-3-validator-network.md) | Docker setup guide                               |
+| [Docker README](docker/README.md)                                  | Quick start for local testing                    |
 
 ## License
 
