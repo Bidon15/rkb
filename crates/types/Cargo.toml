@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enable test utilities like Block::test_block()
+test-utils = []
+
 [dependencies]
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true

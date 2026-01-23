@@ -51,6 +51,32 @@ pub trait Execution: Send + Sync {
 /// from its mempool, rather than the sequencer specifying transactions.
 #[async_trait::async_trait]
 pub trait BlockBuilder: Send + Sync {
+    /// Get reth's current head block.
+    ///
+    /// Returns the (hash, number) of reth's chain head. Used for sync-aware
+    /// proposals to verify consensus state matches execution state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    async fn get_head(&self) -> Result<(B256, u64)>;
+
+    /// Import a payload to reth without updating forkchoice.
+    ///
+    /// This calls `newPayloadV3` to make reth aware of a block, but does NOT
+    /// make it the chain head. This is how Ethereum works:
+    /// 1. Blocks are gossiped and imported (newPayload)
+    /// 2. Finality is determined (attestations/consensus)
+    /// 3. Head is updated (forkchoiceUpdated)
+    ///
+    /// By importing blocks early (on relay receive), reth knows about them
+    /// before we try to build on top of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the import fails.
+    async fn import_payload(&self, payload: &BuiltPayload) -> Result<()>;
+
     /// Start building a new block.
     ///
     /// Calls `forkchoiceUpdated` with payload attributes to signal reth

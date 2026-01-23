@@ -542,7 +542,7 @@ impl CelestiaClient {
                 Blob::new(self.namespace, blob_data, Some(address), AppVersion::latest())
                     .map_err(|e| CelestiaError::EncodeFailed(format!("failed to create blob: {e}")))?;
             blobs.push(blob);
-            block_infos.push((block.hash(), block.height()));
+            block_infos.push((block.block_hash, block.height()));
         }
 
         // Submit all blobs in one transaction
@@ -605,7 +605,7 @@ impl CelestiaClient {
 #[async_trait::async_trait]
 impl DataAvailability for CelestiaClient {
     async fn submit_block(&self, block: &Block) -> Result<BlobSubmission> {
-        let block_hash = block.hash();
+        let block_hash = block.block_hash;
         let block_height = block.height();
 
         tracing::debug!(
@@ -678,12 +678,12 @@ mod tests {
             proposer: alloy_primitives::Address::ZERO,
         };
 
-        let block = Block::new(header, vec![]);
+        let block = Block::test_block(header, vec![]);
 
         let encoded = CelestiaClient::encode_block(&block).unwrap();
         let decoded = CelestiaClient::decode_block(&encoded).unwrap();
 
         assert_eq!(block.height(), decoded.height());
-        assert_eq!(block.hash(), decoded.hash());
+        assert_eq!(block.block_hash, decoded.block_hash);
     }
 }

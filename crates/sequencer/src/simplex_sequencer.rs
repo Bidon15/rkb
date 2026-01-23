@@ -257,7 +257,7 @@ impl SimplexSequencer {
 
         for (celestia_height, block) in sorted_blocks {
             let block_height = block.height();
-            let block_hash = block.hash();
+            let block_hash = block.block_hash;
 
             // Skip already-indexed blocks
             if index.get_by_height(block_height).is_some() {
@@ -385,7 +385,7 @@ impl SimplexSequencer {
             let celestia = Arc::clone(&celestia);
 
             async move {
-                let block_hash = block.hash();
+                let block_hash = block.block_hash;
                 let block_height = block.height();
 
                 // Execute block on reth
@@ -890,7 +890,7 @@ mod tests {
             parent_hash: alloy_primitives::B256::ZERO,
             proposer: Address::ZERO,
         };
-        let block = Block::new(header, vec![]);
+        let block = Block::test_block(header, vec![]);
 
         let size = estimate_block_size(&block);
         assert!(size > 0);

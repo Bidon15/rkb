@@ -46,5 +46,9 @@ sha2 = { workspace = true }
 ripemd = { workspace = true }
 bech32 = { workspace = true }
 
+[dev-dependencies]
+# Enable test-utils for Block::test_block() in tests
+sequencer-types = { workspace = true, features = ["test-utils"] }
+
 [lints]
 workspace = true

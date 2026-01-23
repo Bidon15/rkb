@@ -6,7 +6,9 @@ license.workspace = true
 description = "PoA consensus module using commonware-consensus"
 
 [dependencies]
-sequencer-types.workspace = true
+# Enable test-utils for the simple PoA engine (engine.rs) which creates blocks
+# without reth. Production code uses SimplexConsensus which goes through reth.
+sequencer-types = { workspace = true, features = ["test-utils"] }
 sequencer-execution.workspace = true
 
 # Commonware consensus
@@ -22,7 +24,9 @@ commonware-utils.workspace = true
 rand.workspace = true
 
 alloy-primitives.workspace = true
+bincode.workspace = true
 bytes = "1"
+serde.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true

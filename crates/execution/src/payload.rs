@@ -34,7 +34,7 @@ pub struct PayloadAttributes {
 }
 
 /// A block built by reth via the builder flow.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuiltPayload {
     /// The block hash (computed by reth).
     pub block_hash: B256,

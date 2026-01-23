@@ -27,58 +27,50 @@ pub struct BlockHeader {
     pub proposer: Address,
 }
 
-/// A complete block with header and transactions.
+/// A complete block with header, transactions, and execution results.
+///
+/// All blocks in the system are built via reth and contain the full
+/// execution data. This ensures we fail fast at the source (reth integration)
+/// rather than later with confusing None errors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     /// Block header.
     pub header: BlockHeader,
 
-    /// Ordered transactions.
+    /// Ordered transactions (RLP encoded).
     pub transactions: Vec<Transaction>,
 
     /// Validator signatures.
     pub signatures: Vec<Signature>,
 
-    // === Reth-computed fields (set when built via vanilla Ethereum flow) ===
-    // These fields are populated by the proposer from reth's BuiltPayload.
-    // They're needed so validators can call newPayloadV3 with the correct values.
+    // === Reth-computed fields (required - blocks are always built via reth) ===
 
     /// State root computed by reth after executing transactions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_root: Option<B256>,
+    pub state_root: B256,
 
     /// Receipts root computed by reth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receipts_root: Option<B256>,
+    pub receipts_root: B256,
 
     /// Logs bloom filter computed by reth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logs_bloom: Option<Bytes>,
+    pub logs_bloom: Bytes,
 
     /// Previous RANDAO value used by reth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_randao: Option<B256>,
+    pub prev_randao: B256,
 
     /// Extra data used by reth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_data: Option<Bytes>,
+    pub extra_data: Bytes,
 
     /// Gas used by all transactions (computed by reth).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gas_used: Option<u64>,
+    pub gas_used: u64,
 
     /// Gas limit for the block.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gas_limit: Option<u64>,
+    pub gas_limit: u64,
 
     /// Base fee per gas.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_fee_per_gas: Option<u64>,
+    pub base_fee_per_gas: u64,
 
     /// The authoritative block hash computed by reth.
-    /// This is different from `hash()` which computes from our header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reth_block_hash: Option<B256>,
+    pub block_hash: B256,
 }
 
 /// Validator signature on a block.
@@ -194,64 +186,62 @@ mod hex_bytes {
     }
 }
 
+/// Parameters for creating a new block from reth execution.
+#[derive(Debug, Clone)]
+pub struct BlockParams {
+    /// Block header.
+    pub header: BlockHeader,
+    /// Transactions (RLP encoded).
+    pub transactions: Vec<Transaction>,
+    /// State root from reth.
+    pub state_root: B256,
+    /// Receipts root from reth.
+    pub receipts_root: B256,
+    /// Logs bloom from reth.
+    pub logs_bloom: Bytes,
+    /// Previous RANDAO value.
+    pub prev_randao: B256,
+    /// Extra data.
+    pub extra_data: Bytes,
+    /// Gas used.
+    pub gas_used: u64,
+    /// Gas limit.
+    pub gas_limit: u64,
+    /// Base fee per gas.
+    pub base_fee_per_gas: u64,
+    /// Block hash computed by reth.
+    pub block_hash: B256,
+}
+
 impl Block {
-    /// Create a new block.
+    /// Create a new block with all required execution data.
+    ///
+    /// All blocks in the system must be created with complete reth execution data.
+    /// This ensures we fail fast if reth integration is broken.
     #[must_use]
-    pub fn new(header: BlockHeader, transactions: Vec<Transaction>) -> Self {
+    pub fn new(params: BlockParams) -> Self {
         Self {
-            header,
-            transactions,
+            header: params.header,
+            transactions: params.transactions,
             signatures: Vec::new(),
-            state_root: None,
-            receipts_root: None,
-            logs_bloom: None,
-            prev_randao: None,
-            extra_data: None,
-            gas_used: None,
-            gas_limit: None,
-            base_fee_per_gas: None,
-            reth_block_hash: None,
+            state_root: params.state_root,
+            receipts_root: params.receipts_root,
+            logs_bloom: params.logs_bloom,
+            prev_randao: params.prev_randao,
+            extra_data: params.extra_data,
+            gas_used: params.gas_used,
+            gas_limit: params.gas_limit,
+            base_fee_per_gas: params.base_fee_per_gas,
+            block_hash: params.block_hash,
         }
     }
 
-    /// Set the reth-computed fields from a built payload.
+    /// Compute the header hash (keccak256 of RLP-encoded header).
     ///
-    /// This should be called by the proposer after building a block via reth.
-    pub fn set_reth_fields(
-        &mut self,
-        state_root: B256,
-        receipts_root: B256,
-        logs_bloom: Bytes,
-        prev_randao: B256,
-        extra_data: Bytes,
-        gas_used: u64,
-        gas_limit: u64,
-        base_fee_per_gas: u64,
-        reth_block_hash: B256,
-    ) {
-        self.state_root = Some(state_root);
-        self.receipts_root = Some(receipts_root);
-        self.logs_bloom = Some(logs_bloom);
-        self.prev_randao = Some(prev_randao);
-        self.extra_data = Some(extra_data);
-        self.gas_used = Some(gas_used);
-        self.gas_limit = Some(gas_limit);
-        self.base_fee_per_gas = Some(base_fee_per_gas);
-        self.reth_block_hash = Some(reth_block_hash);
-    }
-
-    /// Check if this block has reth-computed fields populated.
+    /// Note: For the authoritative block hash, use `block_hash` field instead.
+    /// This method computes a hash from our simplified header only.
     #[must_use]
-    pub fn has_reth_fields(&self) -> bool {
-        self.state_root.is_some()
-    }
-
-    /// Compute the block hash (keccak256 of RLP-encoded header).
-    ///
-    /// Note: This performs RLP encoding and cryptographic hash computation on each call.
-    /// Cache the result if calling multiple times.
-    #[must_use]
-    pub fn hash(&self) -> BlockHash {
+    pub fn header_hash(&self) -> BlockHash {
         let mut buf = Vec::new();
         self.header.encode(&mut buf);
         keccak256(&buf)
@@ -279,5 +269,31 @@ impl Block {
     #[must_use]
     pub fn tx_count(&self) -> usize {
         self.transactions.len()
+    }
+}
+
+// Test utilities - only available in test builds
+#[cfg(any(test, feature = "test-utils"))]
+impl Block {
+    /// Create a test block with minimal required fields.
+    ///
+    /// **WARNING**: This is for unit tests only. Production code must create
+    /// blocks through reth execution which provides all required fields.
+    #[must_use]
+    pub fn test_block(header: BlockHeader, transactions: Vec<Transaction>) -> Self {
+        Self {
+            header,
+            transactions,
+            signatures: Vec::new(),
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bytes::new(),
+            prev_randao: B256::ZERO,
+            extra_data: Bytes::new(),
+            gas_used: 0,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: 1_000_000_000, // 1 gwei
+            block_hash: B256::ZERO,
+        }
     }
 }

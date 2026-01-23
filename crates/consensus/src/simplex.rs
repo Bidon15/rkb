@@ -192,7 +192,7 @@ impl SimplexConsensus {
             execution: Arc::clone(&config.execution),
             mailbox_size: config.mailbox_size,
         };
-        let (application, mailbox, _block_receiver) = Application::new(app_config);
+        let (application, mailbox, _block_receiver, _block_relay_receiver) = Application::new(app_config);
 
         // Get block sender for cloning
         let (block_sender, _) = broadcast::channel(100);

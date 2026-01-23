@@ -8,7 +8,7 @@ mod block;
 mod config;
 mod transaction;
 
-pub use block::{Block, BlockHash, BlockHeader, Signature};
+pub use block::{Block, BlockHash, BlockHeader, BlockParams, Signature};
 pub use config::{CelestiaConfig, ChainConfig, ConsensusConfig, ExecutionConfig};
 pub use transaction::{Transaction, TransactionHash};
 

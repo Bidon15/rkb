@@ -6,12 +6,6 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 // Constants
 // =============================================================================
 
-/// Default gas limit for block execution.
-const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
-
-/// Default base fee per gas (1 gwei).
-const DEFAULT_BASE_FEE_GWEI: u64 = 1_000_000_000;
-
 /// HMAC-SHA256 block size in bytes.
 const HMAC_BLOCK_SIZE: usize = 64;
 
@@ -106,6 +100,41 @@ impl ExecutionClient {
 
         tracing::info!(genesis_hash = %response.hash, "Retrieved genesis block hash from reth");
         Ok(response.hash)
+    }
+
+    /// Get reth's current head block hash and number.
+    ///
+    /// This queries `eth_getBlockByNumber("latest")` to get reth's actual
+    /// chain head. Used for sync-aware proposals to verify our state matches reth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn get_head(&self) -> Result<(B256, u64)> {
+        #[derive(serde::Deserialize)]
+        struct BlockResponse {
+            hash: B256,
+            #[serde(deserialize_with = "deserialize_u64_hex")]
+            number: u64,
+        }
+
+        /// Deserialize a hex string (with 0x prefix) to u64
+        fn deserialize_u64_hex<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let s: String = serde::Deserialize::deserialize(deserializer)?;
+            u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                .map_err(serde::de::Error::custom)
+        }
+
+        let response: BlockResponse = self
+            .client
+            .request("eth_getBlockByNumber", rpc_params!["latest", false])
+            .await
+            .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to get head: {e}")))?;
+
+        Ok((response.hash, response.number))
     }
 
     /// Initialize the forkchoice state with the genesis block hash.
@@ -249,8 +278,8 @@ impl ExecutionClient {
 
     /// Build execution payload from block.
     ///
-    /// If the block has reth-computed fields (from the vanilla Ethereum build flow),
-    /// those are used. Otherwise, defaults are used (for sync from Celestia).
+    /// All blocks now have required reth-computed fields from the vanilla Ethereum
+    /// build flow, so this is a direct conversion.
     fn build_payload(block: &Block) -> ExecutionPayloadV3 {
         // Collect transaction bytes
         let transactions: Vec<Bytes> = block
@@ -259,51 +288,21 @@ impl ExecutionClient {
             .map(|tx| Bytes::from(tx.data().to_vec()))
             .collect();
 
-        // Use reth-computed fields if available, otherwise use defaults
-        let (state_root, receipts_root, logs_bloom, prev_randao, extra_data, gas_used, gas_limit, base_fee, block_hash) =
-            if block.has_reth_fields() {
-                (
-                    block.state_root.unwrap_or(B256::ZERO),
-                    block.receipts_root.unwrap_or(B256::ZERO),
-                    block.logs_bloom.as_ref()
-                        .map(|b| alloy_primitives::Bloom::from_slice(b))
-                        .unwrap_or_default(),
-                    block.prev_randao.unwrap_or(block.parent_hash()),
-                    block.extra_data.clone().unwrap_or_default(),
-                    block.gas_used.unwrap_or(0),
-                    block.gas_limit.unwrap_or(DEFAULT_GAS_LIMIT),
-                    U256::from(block.base_fee_per_gas.unwrap_or(DEFAULT_BASE_FEE_GWEI)),
-                    block.reth_block_hash.unwrap_or_else(|| block.hash()),
-                )
-            } else {
-                // Fallback for blocks without reth fields (e.g., from Celestia sync)
-                (
-                    B256::ZERO,
-                    B256::ZERO,
-                    Default::default(),
-                    block.parent_hash(),
-                    Bytes::new(),
-                    0,
-                    DEFAULT_GAS_LIMIT,
-                    U256::from(DEFAULT_BASE_FEE_GWEI),
-                    block.hash(),
-                )
-            };
-
+        // All fields are now required - no more conditional defaults
         let v1 = ExecutionPayloadV1 {
             parent_hash: block.parent_hash(),
             fee_recipient: block.header.proposer,
-            state_root,
-            receipts_root,
-            logs_bloom,
-            prev_randao,
+            state_root: block.state_root,
+            receipts_root: block.receipts_root,
+            logs_bloom: alloy_primitives::Bloom::from_slice(&block.logs_bloom),
+            prev_randao: block.prev_randao,
             block_number: block.height(),
-            gas_limit,
-            gas_used,
+            gas_limit: block.gas_limit,
+            gas_used: block.gas_used,
             timestamp: block.timestamp(),
-            extra_data,
-            base_fee_per_gas: base_fee,
-            block_hash,
+            extra_data: block.extra_data.clone(),
+            base_fee_per_gas: U256::from(block.base_fee_per_gas),
+            block_hash: block.block_hash,
             transactions,
         };
 
@@ -324,14 +323,11 @@ impl ExecutionClient {
 impl Execution for ExecutionClient {
     async fn execute_block(&self, block: &Block) -> Result<ExecutionResult> {
         let block_height = block.height();
-        // Use reth block hash if available, otherwise compute our own
-        let block_hash = block.reth_block_hash.unwrap_or_else(|| block.hash());
-        let has_reth_fields = block.has_reth_fields();
+        let block_hash = block.block_hash;
 
         tracing::debug!(
             block_height,
             %block_hash,
-            has_reth_fields,
             parent_hash = %block.parent_hash(),
             tx_count = block.tx_count(),
             "Executing block via Engine API"
@@ -427,6 +423,81 @@ impl Execution for ExecutionClient {
 
 #[async_trait::async_trait]
 impl BlockBuilder for ExecutionClient {
+    async fn get_head(&self) -> Result<(B256, u64)> {
+        // Delegate to inherent method
+        Self::get_head(self).await
+    }
+
+    async fn import_payload(&self, payload: &BuiltPayload) -> Result<()> {
+        tracing::debug!(
+            block_number = payload.block_number,
+            %payload.block_hash,
+            "Importing payload to reth (newPayloadV3 only, no forkchoice update)"
+        );
+
+        // Reconstruct ExecutionPayloadV3 from BuiltPayload
+        let v1 = ExecutionPayloadV1 {
+            parent_hash: payload.parent_hash,
+            fee_recipient: payload.fee_recipient,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: alloy_primitives::Bloom::from_slice(&payload.logs_bloom),
+            prev_randao: payload.prev_randao,
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: payload.extra_data.clone(),
+            base_fee_per_gas: U256::from(payload.base_fee_per_gas),
+            block_hash: payload.block_hash,
+            transactions: payload.transactions.clone(),
+        };
+
+        let v2 = ExecutionPayloadV2 {
+            payload_inner: v1,
+            withdrawals: vec![],
+        };
+
+        let execution_payload = ExecutionPayloadV3 {
+            payload_inner: v2,
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+
+        // Call engine_newPayloadV3 to import (NOT finalize) the block
+        let response: PayloadStatus = self
+            .client
+            .request(
+                "engine_newPayloadV3",
+                rpc_params![execution_payload, Vec::<B256>::new(), B256::ZERO],
+            )
+            .await
+            .map_err(|e| ExecutionError::ExecutionFailed(format!("newPayload RPC failed: {e}")))?;
+
+        tracing::debug!(
+            ?response.status,
+            latest_valid_hash = ?response.latest_valid_hash,
+            block_number = payload.block_number,
+            "engine_newPayloadV3 response (import only)"
+        );
+
+        match response.status {
+            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted | PayloadStatusEnum::Syncing => {
+                // Block imported successfully (or reth is processing it)
+                tracing::info!(
+                    block_number = payload.block_number,
+                    %payload.block_hash,
+                    status = ?response.status,
+                    "Payload imported to reth"
+                );
+                Ok(())
+            }
+            PayloadStatusEnum::Invalid { ref validation_error } => {
+                Err(ExecutionError::InvalidBlock(validation_error.clone()))
+            }
+        }
+    }
+
     async fn start_building(
         &self,
         parent_hash: B256,
@@ -440,12 +511,15 @@ impl BlockBuilder for ExecutionClient {
             "Starting block building"
         );
 
-        // Get current forkchoice
+        // Get current forkchoice for finalized hash
         let current = *self.forkchoice.read().await;
 
+        // Use parent_hash for both head and safe to avoid state inconsistency.
+        // In our PoA model with no reorgs, the parent we're building on is safe.
+        // Finalized comes from the cached state (updated on DA confirmation).
         let engine_state = EngineForkchoiceState {
             head_block_hash: parent_hash,
-            safe_block_hash: current.safe,
+            safe_block_hash: parent_hash,
             finalized_block_hash: current.finalized,
         };
 
@@ -477,7 +551,7 @@ impl BlockBuilder for ExecutionClient {
             payload_id = ?response.payload_id,
             latest_valid_hash = ?response.payload_status.latest_valid_hash,
             head = %parent_hash,
-            safe = %current.safe,
+            safe = %parent_hash,
             finalized = %current.finalized,
             "engine_forkchoiceUpdatedV3 response (with payload attributes)"
         );

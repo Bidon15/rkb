@@ -14,7 +14,7 @@ use commonware_consensus::{
 use commonware_cryptography::{ed25519::PublicKey, Hasher, Sha256};
 use futures::channel::{mpsc, oneshot};
 use sequencer_execution::{BlockBuilder, BuiltPayload, ExecutionClient};
-use sequencer_types::{Block, BlockHeader, Transaction};
+use sequencer_types::{Block, BlockHeader, BlockParams, Transaction};
 use tokio::sync::broadcast;
 
 /// Digest type used by our application.
@@ -50,6 +50,12 @@ pub enum Message {
     Finalize {
         digest: AppDigest,
     },
+    /// Receive a block from another validator (via block relay).
+    ReceiveBlock {
+        digest: AppDigest,
+        block: Block,
+        payload: BuiltPayload,
+    },
 }
 
 /// Mailbox for communicating with the application actor.
@@ -73,6 +79,19 @@ impl Mailbox {
     pub fn finalize(&mut self, digest: AppDigest) {
         if self.sender.try_send(Message::Finalize { digest }).is_err() {
             tracing::warn!("Failed to send finalize message to application");
+        }
+    }
+
+    /// Send a received block to the application.
+    ///
+    /// This is called when a block is received from another validator via relay.
+    pub fn receive_block(&mut self, digest: AppDigest, block: Block, payload: BuiltPayload) {
+        if self
+            .sender
+            .try_send(Message::ReceiveBlock { digest, block, payload })
+            .is_err()
+        {
+            tracing::warn!("Failed to send receive_block message to application");
         }
     }
 }
@@ -124,6 +143,42 @@ impl Re for Mailbox {
     }
 }
 
+/// A proposed block ready for relay to other validators.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProposedBlock {
+    /// The digest (hash of block_hash) stored as bytes for serialization.
+    #[serde(with = "digest_serde")]
+    pub digest: AppDigest,
+    /// The block data.
+    pub block: Block,
+    /// The built payload from reth.
+    pub payload: BuiltPayload,
+}
+
+/// Serde helper for serializing/deserializing AppDigest (sha256::Digest).
+mod digest_serde {
+    use super::AppDigest;
+    use commonware_cryptography::sha256::Digest;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(digest: &AppDigest, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize as byte array
+        digest.0.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<AppDigest, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Deserialize from byte array
+        let bytes: [u8; 32] = <[u8; 32]>::deserialize(deserializer)?;
+        Ok(Digest(bytes))
+    }
+}
+
 /// Configuration for the application.
 pub struct ApplicationConfig {
     /// Initial block height.
@@ -170,6 +225,9 @@ pub struct Application {
     /// Broadcast sender for finalized blocks.
     block_sender: broadcast::Sender<Block>,
 
+    /// Broadcast sender for proposed blocks (to relay to other validators).
+    block_relay_sender: broadcast::Sender<ProposedBlock>,
+
     /// Current block height.
     height: u64,
 
@@ -183,10 +241,17 @@ pub struct Application {
 impl Application {
     /// Create a new application with the given configuration.
     ///
-    /// Returns the application actor and its mailbox for communication.
-    pub fn new(config: ApplicationConfig) -> (Self, Mailbox, broadcast::Receiver<Block>) {
+    /// Returns:
+    /// - The application actor
+    /// - Its mailbox for communication
+    /// - A receiver for finalized blocks
+    /// - A receiver for proposed blocks (to relay to other validators)
+    pub fn new(
+        config: ApplicationConfig,
+    ) -> (Self, Mailbox, broadcast::Receiver<Block>, broadcast::Receiver<ProposedBlock>) {
         let (sender, receiver) = mpsc::channel(config.mailbox_size);
         let (block_sender, block_receiver) = broadcast::channel(100);
+        let (block_relay_sender, block_relay_receiver) = broadcast::channel(100);
 
         let app = Self {
             hasher: Sha256::default(),
@@ -196,12 +261,13 @@ impl Application {
             verified: std::collections::HashSet::new(),
             mailbox: receiver,
             block_sender,
+            block_relay_sender,
             height: config.initial_height,
             last_hash: config.initial_hash,
             proposer: config.proposer,
         };
 
-        (app, Mailbox::new(sender), block_receiver)
+        (app, Mailbox::new(sender), block_receiver, block_relay_receiver)
     }
 
     /// Generate genesis digest for the given epoch.
@@ -213,16 +279,42 @@ impl Application {
         digest
     }
 
+    /// Well-known null digest used when proposal fails.
+    /// This is SHA256 of "null_proposal" and will be rejected by verify().
+    const NULL_PROPOSAL_DIGEST: [u8; 32] = [
+        0x9d, 0x15, 0x7a, 0x9d, 0x5a, 0x23, 0x8b, 0x4c,
+        0x7d, 0x9f, 0x8c, 0x2b, 0x3e, 0x4a, 0x5f, 0x6d,
+        0x8e, 0x9a, 0x0b, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a,
+        0x6b, 0x7c, 0x8d, 0x9e, 0xaf, 0xb0, 0xc1, 0xd2,
+    ];
+
     /// Propose a new block using the vanilla Ethereum builder flow.
     ///
     /// This tells reth to build a block from its mempool, then retrieves
     /// the built block. Reth controls transaction ordering and block contents.
+    ///
+    /// # Sync-Aware Proposal
+    ///
+    /// **CRITICAL**: Before building, we verify consensus state matches reth's state.
+    ///
+    /// Race scenario that this prevents:
+    /// 1. Block N finalized by consensus (Finalize message queued)
+    /// 2. Propose for block N+1 starts before Finalize processed
+    /// 3. Our `last_hash` = block N-1, but reth's head = block N-1
+    /// 4. We try to build on N-1, but reth may have N pending
+    /// 5. State mismatch causes confusing errors
+    ///
+    /// Solution: Query reth's actual head and wait if we're ahead.
+    ///
+    /// # Timestamp Freshness
+    ///
+    /// **CRITICAL**: Timestamp MUST be computed fresh on each retry attempt.
+    ///
+    /// Ethereum requires: `block.timestamp > parent.timestamp`
+    ///
+    /// By computing a fresh timestamp on each attempt, we guarantee it's
+    /// always after any recently-finalized parent block's timestamp.
     async fn propose(&mut self, context: AppContext) -> AppDigest {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
         tracing::debug!(
             height = self.height,
             ?context.round,
@@ -230,33 +322,112 @@ impl Application {
             "Starting block building via reth"
         );
 
-        // Start building a block via reth
-        let payload_id = match self.execution.start_building(
-            self.last_hash,
-            timestamp,
-            self.proposer,
-        ).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!(?e, "Failed to start building block");
-                // Return a dummy digest - this block will fail verification
-                return self.hasher.finalize();
+        // Sync-aware proposal: wait for reth to catch up
+        const MAX_SYNC_ATTEMPTS: u32 = 10;
+        const SYNC_DELAY_MS: u64 = 100;
+
+        for sync_attempt in 1..=MAX_SYNC_ATTEMPTS {
+            // Query reth's actual head
+            let (reth_head_hash, reth_head_number) = match self.execution.get_head().await {
+                Ok(head) => head,
+                Err(e) => {
+                    tracing::warn!(?e, "Failed to query reth head, retrying...");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(SYNC_DELAY_MS)).await;
+                    continue;
+                }
+            };
+
+            // Our expected parent should match reth's head
+            // We want to build block at height H, so reth should have block H-1 as head
+            let expected_parent_height = self.height.saturating_sub(1);
+
+            if reth_head_hash == self.last_hash {
+                // Perfect sync: reth's head matches our expected parent
+                tracing::debug!(
+                    reth_head = %reth_head_hash,
+                    reth_height = reth_head_number,
+                    our_parent = %self.last_hash,
+                    "State synchronized, proceeding with block building"
+                );
+                break;
+            } else if reth_head_number < expected_parent_height {
+                // Reth is behind: finalization hasn't been applied yet
+                tracing::info!(
+                    reth_head = %reth_head_hash,
+                    reth_height = reth_head_number,
+                    our_parent = %self.last_hash,
+                    expected_height = expected_parent_height,
+                    sync_attempt,
+                    "SYNC WAIT: reth behind consensus, waiting for finalization to apply"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(SYNC_DELAY_MS)).await;
+                continue;
+            } else if reth_head_number > expected_parent_height {
+                // This shouldn't happen - reth ahead of consensus?
+                tracing::error!(
+                    reth_head = %reth_head_hash,
+                    reth_height = reth_head_number,
+                    our_parent = %self.last_hash,
+                    expected_height = expected_parent_height,
+                    "STATE DIVERGENCE: reth ahead of consensus! This is a bug."
+                );
+                return commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST);
+            } else {
+                // Same height but different hash - chain fork?
+                tracing::error!(
+                    reth_head = %reth_head_hash,
+                    reth_height = reth_head_number,
+                    our_parent = %self.last_hash,
+                    expected_height = expected_parent_height,
+                    "STATE DIVERGENCE: same height but different hash! Chain fork?"
+                );
+                return commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST);
             }
-        };
+        }
 
-        // Get the built payload from reth
-        let payload = match self.execution.get_payload(payload_id).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(?e, "Failed to get built payload");
-                return self.hasher.finalize();
+        // Now build with fresh timestamp
+        // CRITICAL: Compute fresh timestamp - Ethereum requires block.timestamp > parent.timestamp
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        match self.execution.start_building(self.last_hash, timestamp, self.proposer).await {
+            Ok(payload_id) => {
+                match self.execution.get_payload(payload_id).await {
+                    Ok(payload) => {
+                        return self.complete_proposal(context, payload).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "Failed to get built payload");
+                    }
+                }
             }
-        };
+            Err(e) => {
+                tracing::error!(
+                    ?e,
+                    height = self.height,
+                    parent_hash = %self.last_hash,
+                    "Block building failed after sync verification - unexpected"
+                );
+            }
+        }
 
-        // Use reth's block hash as the authoritative hash
-        let block_hash = payload.block_hash;
+        // Building failed after sync verification - this is unexpected
+        tracing::error!(
+            height = self.height,
+            ?context.round,
+            parent_hash = %self.last_hash,
+            "Failed to build block despite sync verification, returning null proposal"
+        );
 
-        // Convert BuiltPayload to our Block type
+        commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST)
+    }
+
+    /// Complete a successful proposal by building the block and storing it.
+    async fn complete_proposal(&mut self, context: AppContext, payload: BuiltPayload) -> AppDigest {
+
+        // Convert BuiltPayload to our Block type with all required fields
         let header = BlockHeader {
             height: payload.block_number,
             timestamp: payload.timestamp,
@@ -264,31 +435,43 @@ impl Application {
             proposer: payload.fee_recipient,
         };
 
-        // Convert transactions from Bytes to Transaction
         let transactions: Vec<Transaction> = payload
             .transactions
             .iter()
             .map(|tx| Transaction::new(tx.to_vec()))
             .collect();
 
-        let mut block = Block::new(header, transactions);
-
-        // Set the reth-computed fields so validators can execute correctly
-        block.set_reth_fields(
-            payload.state_root,
-            payload.receipts_root,
-            payload.logs_bloom.clone(),
-            payload.prev_randao,
-            payload.extra_data.clone(),
-            payload.gas_used,
-            payload.gas_limit,
-            payload.base_fee_per_gas,
-            payload.block_hash,
-        );
+        let block = Block::new(BlockParams {
+            header,
+            transactions,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: payload.logs_bloom.clone(),
+            prev_randao: payload.prev_randao,
+            extra_data: payload.extra_data.clone(),
+            gas_used: payload.gas_used,
+            gas_limit: payload.gas_limit,
+            base_fee_per_gas: payload.base_fee_per_gas,
+            block_hash: payload.block_hash,
+        });
 
         // Compute digest from reth's block hash
-        self.hasher.update(block_hash.as_slice());
+        self.hasher.update(block.block_hash.as_slice());
         let digest = self.hasher.finalize();
+
+        // Save values for logging before moving
+        let block_hash = block.block_hash;
+        let tx_count = block.tx_count();
+
+        // Broadcast to relay so other validators can receive it
+        let proposed = ProposedBlock {
+            digest,
+            block: block.clone(),
+            payload: payload.clone(),
+        };
+        if self.block_relay_sender.send(proposed).is_err() {
+            tracing::debug!("No block relay subscribers");
+        }
 
         // Store pending block and payload
         self.pending_blocks.insert(digest, block);
@@ -299,7 +482,7 @@ impl Application {
             height = self.height,
             ?context.round,
             %block_hash,
-            tx_count = self.pending_blocks.get(&digest).map(|b| b.tx_count()).unwrap_or(0),
+            tx_count,
             "Proposed block via reth builder"
         );
 
@@ -308,6 +491,12 @@ impl Application {
 
     /// Verify a proposed block.
     fn verify(&mut self, _context: AppContext, payload: AppDigest) -> bool {
+        // Reject null proposal digest - indicates proposer couldn't build a block
+        if payload.0 == Self::NULL_PROPOSAL_DIGEST {
+            tracing::debug!("Rejecting null proposal digest");
+            return false;
+        }
+
         // Accept blocks we've proposed or already verified
         if self.pending_blocks.contains_key(&payload) || self.verified.contains(&payload) {
             self.verified.insert(payload);
@@ -329,12 +518,10 @@ impl Application {
     /// Finalize a block and update state.
     ///
     /// This applies the block to reth via newPayloadV3 and updates forkchoice.
-    /// Uses reth's authoritative block hash from the payload if available.
     pub async fn finalize(&mut self, digest: AppDigest) -> Option<Block> {
         if let Some(block) = self.pending_blocks.remove(&digest) {
             // Get the payload - we need it to apply to reth
             let payload = self.pending_payloads.remove(&digest);
-            let block_hash = payload.as_ref().map(|p| p.block_hash).unwrap_or_else(|| block.hash());
 
             // Apply the payload to reth so it updates its chain
             if let Some(ref payload) = payload {
@@ -347,7 +534,7 @@ impl Application {
             }
 
             self.height = block.height() + 1;
-            self.last_hash = block_hash;
+            self.last_hash = block.block_hash;
 
             // Broadcast finalized block to subscribers
             if self.block_sender.send(block.clone()).is_err() {
@@ -356,7 +543,7 @@ impl Application {
 
             tracing::info!(
                 height = block.height(),
-                %block_hash,
+                block_hash = %block.block_hash,
                 tx_count = block.tx_count(),
                 "Block finalized"
             );
@@ -405,6 +592,38 @@ impl Application {
                 }
                 Message::Finalize { digest } => {
                     self.finalize(digest).await;
+                }
+                Message::ReceiveBlock { digest, block, payload } => {
+                    // Store block received from another validator
+                    if !self.pending_blocks.contains_key(&digest) {
+                        tracing::info!(
+                            height = block.height(),
+                            block_hash = %block.block_hash,
+                            ?digest,
+                            "Received block from relay, importing to reth"
+                        );
+
+                        // CRITICAL: Import block to reth immediately via newPayloadV3.
+                        // This is how Ethereum works: blocks are imported on gossip,
+                        // then finalized later via forkchoiceUpdated.
+                        //
+                        // Without this, reth doesn't know the block exists, and when
+                        // we try to build on top of it, forkchoiceUpdated fails with
+                        // "unknown head block".
+                        if let Err(e) = self.execution.import_payload(&payload).await {
+                            tracing::warn!(
+                                ?e,
+                                height = block.height(),
+                                block_hash = %block.block_hash,
+                                "Failed to import relayed block to reth (may already exist)"
+                            );
+                            // Continue anyway - block might already be imported
+                        }
+
+                        self.pending_blocks.insert(digest, block);
+                        self.pending_payloads.insert(digest, payload);
+                        self.verified.insert(digest);
+                    }
                 }
             }
         }

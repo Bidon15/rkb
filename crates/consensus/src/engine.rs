@@ -39,7 +39,7 @@ fn is_leader_for_height(validator_index: Option<usize>, height: u64, validators_
 
 /// Sign a block with the given signer.
 fn sign_block(block: &mut Block, signer: &ed25519::PrivateKey, proposer: Address) {
-    let block_hash = block.hash();
+    let block_hash = block.block_hash;
     let sig = signer.sign(BLOCK_SIGNING_NAMESPACE, block_hash.as_slice());
     let public_key = signer.public_key();
     let signature = Signature::new(proposer, &public_key, &sig);
@@ -201,7 +201,7 @@ impl Consensus {
             proposer,
         };
 
-        let mut block = Block::new(header, transactions);
+        let mut block = Block::test_block(header, transactions);
 
         if let Some(ref signer) = self.signer {
             sign_block(&mut block, signer, proposer);
@@ -250,13 +250,13 @@ impl Consensus {
                         proposer,
                     };
 
-                    let mut block = Block::new(header, transactions);
+                    let mut block = Block::test_block(header, transactions);
 
                     if let Some(ref signing_key) = signer {
                         sign_block(&mut block, signing_key, proposer);
                     }
 
-                    let block_hash = block.hash();
+                    let block_hash = block.block_hash;
                     let tx_count = block.tx_count();
 
                     *height.write().await = current_height + 1;

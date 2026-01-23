@@ -38,7 +38,7 @@ use commonware_consensus::{
     types::{Epoch, ViewDelta},
 };
 use commonware_cryptography::{ed25519, Sha256, Signer};
-use commonware_p2p::{authenticated::discovery, Manager};
+use commonware_p2p::{authenticated::discovery, CheckedSender, LimitedSender, Manager, Receiver, Recipients};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
     buffer::PoolRef,
@@ -49,7 +49,7 @@ use commonware_utils::{ordered::Set, union};
 use rand::{CryptoRng, RngCore};
 use sequencer_types::{Block, ConsensusConfig};
 
-use crate::application::{Application, ApplicationConfig};
+use crate::application::{Application, ApplicationConfig, Mailbox, ProposedBlock};
 use crate::network::{backlog, channels, rate_limits};
 use crate::reporter::ConsensusReporter;
 use crate::{ConsensusError, Result};
@@ -327,6 +327,12 @@ async fn run_simplex<E, C>(
         rate_limits::resolver(),
         backlog::RESOLVER,
     );
+    // Register block relay channel for p2p propagation (must be before network.start())
+    let (block_relay_sender, block_relay_p2p_receiver) = network.register(
+        u64::from(channels::BLOCK_RELAY),
+        rate_limits::block_relay(),
+        backlog::BLOCK_RELAY,
+    );
 
     // Start P2P network
     let network_handle = network.start();
@@ -339,13 +345,18 @@ async fn run_simplex<E, C>(
         execution,
         mailbox_size: config.mailbox_size,
     };
-    let (application, app_mailbox, mut block_receiver) = Application::new(app_config);
+    let (application, app_mailbox, mut block_receiver, block_relay_receiver) =
+        Application::new(app_config);
 
     // Spawn application actor
     let app_context = context.clone().with_label("application");
     app_context.spawn(|_| async move {
         application.run().await;
     });
+
+    // Clone participants and mailbox for the relay task (before they're consumed)
+    let relay_participants = participants.clone();
+    let relay_mailbox = app_mailbox.clone();
 
     // Create scheme, elector config, reporter
     // Note: RoundRobin is an elector Config trait - Engine builds it internally
@@ -361,7 +372,7 @@ async fn run_simplex<E, C>(
         elector,
         blocker: oracle,
         automaton: app_mailbox.clone(),
-        relay: app_mailbox,
+        relay: app_mailbox.clone(),
         reporter,
         strategy: Sequential,
         partition: config.private_key.public_key().to_string(),
@@ -389,6 +400,19 @@ async fn run_simplex<E, C>(
         (cert_sender, cert_receiver),
         (resolver_sender, resolver_receiver),
     );
+
+    // Spawn block relay task - broadcasts proposed blocks to other validators
+    let relay_context = context.clone().with_label("block_relay");
+    relay_context.spawn(move |_| async move {
+        run_block_relay(
+            block_relay_sender,
+            block_relay_p2p_receiver,
+            block_relay_receiver,
+            relay_mailbox,
+            relay_participants,
+        )
+        .await;
+    });
 
     // Track current view for leader detection
     // SAFETY: is_validator() was verified at the start of start_simplex_runtime()
@@ -433,6 +457,107 @@ async fn run_simplex<E, C>(
     // Wait for handles to complete
     drop(engine_handle);
     drop(network_handle);
+}
+
+/// Run the block relay task.
+///
+/// This task:
+/// 1. Receives proposed blocks from the local Application
+/// 2. Broadcasts them to all other validators via p2p
+/// 3. Receives blocks from other validators via p2p
+/// 4. Forwards them to the local Application
+async fn run_block_relay<S, R>(
+    mut sender: S,
+    mut p2p_receiver: R,
+    mut local_receiver: tokio::sync::broadcast::Receiver<ProposedBlock>,
+    mut mailbox: Mailbox,
+    participants: Set<ed25519::PublicKey>,
+) where
+    S: LimitedSender<PublicKey = ed25519::PublicKey> + Send,
+    R: Receiver<PublicKey = ed25519::PublicKey> + Send,
+{
+    use tokio::sync::broadcast::error::RecvError;
+
+    tracing::info!("Block relay task started");
+
+    loop {
+        tokio::select! {
+            // Receive proposed block from local Application and broadcast to peers
+            local_result = local_receiver.recv() => {
+                match local_result {
+                    Ok(proposed) => {
+                        // Serialize the proposed block
+                        let encoded = match bincode::serialize(&proposed) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::error!(?e, "Failed to serialize proposed block");
+                                continue;
+                            }
+                        };
+
+                        tracing::debug!(
+                            height = proposed.block.height(),
+                            digest = ?proposed.digest,
+                            size = encoded.len(),
+                            "Broadcasting proposed block to validators"
+                        );
+
+                        // Broadcast to all validators
+                        let recipients: Vec<_> = participants.iter().cloned().collect();
+                        match sender.check(Recipients::Some(recipients)).await {
+                            Ok(checked) => {
+                                if let Err(e) = checked.send(encoded.as_slice(), true).await {
+                                    tracing::warn!(?e, "Failed to broadcast proposed block");
+                                }
+                            }
+                            Err(next_time) => {
+                                tracing::debug!(?next_time, "Rate limited, skipping broadcast");
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "Block relay receiver lagged");
+                    }
+                    Err(RecvError::Closed) => {
+                        tracing::info!("Block relay local channel closed");
+                        break;
+                    }
+                }
+            }
+
+            // Receive block from p2p and forward to local Application
+            p2p_result = p2p_receiver.recv() => {
+                match p2p_result {
+                    Ok((sender_pk, message)) => {
+                        // Deserialize the proposed block
+                        let proposed: ProposedBlock = match bincode::deserialize(&message) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(?e, ?sender_pk, "Failed to deserialize block from peer");
+                                continue;
+                            }
+                        };
+
+                        tracing::debug!(
+                            height = proposed.block.height(),
+                            digest = ?proposed.digest,
+                            ?sender_pk,
+                            "Received proposed block from peer"
+                        );
+
+                        // Forward to local Application
+                        mailbox.receive_block(proposed.digest, proposed.block, proposed.payload);
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "Block relay p2p receiver error");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("Block relay task stopped");
 }
 
 /// Create the Ed25519 signing scheme for Simplex.
