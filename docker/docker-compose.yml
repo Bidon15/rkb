@@ -36,7 +36,7 @@ services:
       - ./keys/jwt-0.hex:/keys/jwt.hex:ro
       - validator-0-data:/data
     environment:
-      - RUST_LOG=info,sequencer=debug
+      - RUST_LOG=info,sequencer=info
     ports:
       - "26656:26656"  # P2P
     networks:
@@ -84,7 +84,7 @@ services:
       - ./keys/jwt-1.hex:/keys/jwt.hex:ro
       - validator-1-data:/data
     environment:
-      - RUST_LOG=info,sequencer=debug
+      - RUST_LOG=info,sequencer=info
     ports:
       - "26657:26656"  # P2P
     networks:
@@ -132,7 +132,7 @@ services:
       - ./keys/jwt-2.hex:/keys/jwt.hex:ro
       - validator-2-data:/data
     environment:
-      - RUST_LOG=info,sequencer=debug
+      - RUST_LOG=info,sequencer=info
     ports:
       - "26658:26656"  # P2P
     networks:

@@ -271,7 +271,20 @@ impl Application {
             .map(|tx| Transaction::new(tx.to_vec()))
             .collect();
 
-        let block = Block::new(header, transactions);
+        let mut block = Block::new(header, transactions);
+
+        // Set the reth-computed fields so validators can execute correctly
+        block.set_reth_fields(
+            payload.state_root,
+            payload.receipts_root,
+            payload.logs_bloom.clone(),
+            payload.prev_randao,
+            payload.extra_data.clone(),
+            payload.gas_used,
+            payload.gas_limit,
+            payload.base_fee_per_gas,
+            payload.block_hash,
+        );
 
         // Compute digest from reth's block hash
         self.hasher.update(block_hash.as_slice());

@@ -248,6 +248,9 @@ impl ExecutionClient {
     }
 
     /// Build execution payload from block.
+    ///
+    /// If the block has reth-computed fields (from the vanilla Ethereum build flow),
+    /// those are used. Otherwise, defaults are used (for sync from Celestia).
     fn build_payload(block: &Block) -> ExecutionPayloadV3 {
         // Collect transaction bytes
         let transactions: Vec<Bytes> = block
@@ -256,20 +259,51 @@ impl ExecutionClient {
             .map(|tx| Bytes::from(tx.data().to_vec()))
             .collect();
 
+        // Use reth-computed fields if available, otherwise use defaults
+        let (state_root, receipts_root, logs_bloom, prev_randao, extra_data, gas_used, gas_limit, base_fee, block_hash) =
+            if block.has_reth_fields() {
+                (
+                    block.state_root.unwrap_or(B256::ZERO),
+                    block.receipts_root.unwrap_or(B256::ZERO),
+                    block.logs_bloom.as_ref()
+                        .map(|b| alloy_primitives::Bloom::from_slice(b))
+                        .unwrap_or_default(),
+                    block.prev_randao.unwrap_or(block.parent_hash()),
+                    block.extra_data.clone().unwrap_or_default(),
+                    block.gas_used.unwrap_or(0),
+                    block.gas_limit.unwrap_or(DEFAULT_GAS_LIMIT),
+                    U256::from(block.base_fee_per_gas.unwrap_or(DEFAULT_BASE_FEE_GWEI)),
+                    block.reth_block_hash.unwrap_or_else(|| block.hash()),
+                )
+            } else {
+                // Fallback for blocks without reth fields (e.g., from Celestia sync)
+                (
+                    B256::ZERO,
+                    B256::ZERO,
+                    Default::default(),
+                    block.parent_hash(),
+                    Bytes::new(),
+                    0,
+                    DEFAULT_GAS_LIMIT,
+                    U256::from(DEFAULT_BASE_FEE_GWEI),
+                    block.hash(),
+                )
+            };
+
         let v1 = ExecutionPayloadV1 {
             parent_hash: block.parent_hash(),
             fee_recipient: block.header.proposer,
-            state_root: B256::ZERO,     // Computed by reth
-            receipts_root: B256::ZERO,  // Computed by reth
-            logs_bloom: Default::default(),
-            prev_randao: B256::ZERO,    // PoA doesn't use randomness
+            state_root,
+            receipts_root,
+            logs_bloom,
+            prev_randao,
             block_number: block.height(),
-            gas_limit: DEFAULT_GAS_LIMIT,
-            gas_used: 0, // Computed by reth
+            gas_limit,
+            gas_used,
             timestamp: block.timestamp(),
-            extra_data: Bytes::new(),
-            base_fee_per_gas: U256::from(DEFAULT_BASE_FEE_GWEI),
-            block_hash: block.hash(),
+            extra_data,
+            base_fee_per_gas: base_fee,
+            block_hash,
             transactions,
         };
 
@@ -290,11 +324,14 @@ impl ExecutionClient {
 impl Execution for ExecutionClient {
     async fn execute_block(&self, block: &Block) -> Result<ExecutionResult> {
         let block_height = block.height();
-        let block_hash = block.hash();
+        // Use reth block hash if available, otherwise compute our own
+        let block_hash = block.reth_block_hash.unwrap_or_else(|| block.hash());
+        let has_reth_fields = block.has_reth_fields();
 
         tracing::debug!(
             block_height,
             %block_hash,
+            has_reth_fields,
             parent_hash = %block.parent_hash(),
             tx_count = block.tx_count(),
             "Executing block via Engine API"
