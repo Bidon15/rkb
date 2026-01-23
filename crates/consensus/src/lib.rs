@@ -21,6 +21,7 @@ pub mod application;
 mod blocker;
 mod engine;
 mod error;
+mod leader;
 pub mod network;
 mod reporter;
 pub mod runtime;
