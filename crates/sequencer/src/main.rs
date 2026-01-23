@@ -1,7 +1,7 @@
 //! Celestia-native PoA EVM sequencer.
 //!
 //! This binary orchestrates:
-//! - PoA consensus (block production)
+//! - Multi-validator PoA consensus (Simplex BFT)
 //! - Celestia DA (blob submission + finality tracking)
 //! - reth execution (Engine API)
 
@@ -9,7 +9,6 @@
 
 mod cli;
 mod config;
-mod sequencer;
 mod simplex_sequencer;
 
 use clap::Parser;
