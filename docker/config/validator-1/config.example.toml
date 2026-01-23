@@ -1,5 +1,7 @@
 # Validator 1 Configuration
 # Seed: 1
+#
+# Copy this file to config.toml and fill in your Celestia endpoints.
 
 chain_id = 1337
 
@@ -37,15 +39,17 @@ allow_private_ips = true
 # ------------------------------------------------------------------------------
 # Bridge Node (for reading blobs)
 # ------------------------------------------------------------------------------
-bridge_addr = "https://young-weathered-scion.celestia-mocha.quiknode.pro/2ae91d0d78ef0a253990449d0bb7e9f054f024c0/"
+# Replace with your Celestia node RPC endpoint
+bridge_addr = "https://your-celestia-node.example.com/"
 bridge_auth_token = ""
 bridge_tls_enabled = false
 
 # ------------------------------------------------------------------------------
 # Core gRPC (for submitting blobs)
 # ------------------------------------------------------------------------------
-core_grpc_addr = "young-weathered-scion.celestia-mocha.quiknode.pro:9090"
-core_grpc_auth_token = "2ae91d0d78ef0a253990449d0bb7e9f054f024c0"
+# Replace with your Celestia node gRPC endpoint
+core_grpc_addr = "your-celestia-node.example.com:9090"
+core_grpc_auth_token = "your-auth-token-here"
 core_grpc_tls_enabled = true
 
 # Celestia signing key

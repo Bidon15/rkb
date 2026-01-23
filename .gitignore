@@ -6,6 +6,10 @@ docker/keys/*.key
 docker/keys/*.hex
 !docker/keys/.gitkeep
 
+# Docker validator configs (contain sensitive endpoints)
+docker/config/*/config.toml
+!docker/config/*/config.example.toml
+
 # dotenv
 .env
 
