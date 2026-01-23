@@ -19,10 +19,7 @@ dialable_addr = "validator-1:26656"
 p2p_port = 26656
 
 # Bootstrap peers: "seed@host:port"
-peers = [
-    "0@validator-0:26656",
-    "2@validator-2:26656",
-]
+peers = ["0@validator-0:26656", "2@validator-2:26656"]
 
 # Timeouts
 leader_timeout_ms = 2000
@@ -37,18 +34,51 @@ storage_dir = "/data/consensus"
 allow_private_ips = true
 
 [celestia]
-# Celestia Mocha testnet (or local node)
-rpc_endpoint = "https://rpc-mocha.pops.one"
-grpc_endpoint = "https://grpc-mocha.pops.one:443"
+# ------------------------------------------------------------------------------
+# Bridge Node (for reading blobs)
+# ------------------------------------------------------------------------------
+bridge_addr = "https://young-weathered-scion.celestia-mocha.quiknode.pro/2ae91d0d78ef0a253990449d0bb7e9f054f024c0/"
+bridge_auth_token = ""
+bridge_tls_enabled = false
+
+# ------------------------------------------------------------------------------
+# Core gRPC (for submitting blobs)
+# ------------------------------------------------------------------------------
+core_grpc_addr = "young-weathered-scion.celestia-mocha.quiknode.pro:9090"
+core_grpc_auth_token = "2ae91d0d78ef0a253990449d0bb7e9f054f024c0"
+core_grpc_tls_enabled = true
 
 # Celestia signing key
 celestia_key_path = "/keys/celestia.key"
 
-# Namespace (hex-encoded, "astria" padded to 29 bytes)
-namespace = "00000000000000000000000000000000000000617374726961"
+# Namespace (hex-encoded suffix, max 10 bytes - auto-padded by Celestia)
+# "astria" in hex = 617374726961
+namespace = "617374726961"
 
 # Gas price
 gas_price = 0.002
+
+# Batch submission interval (ms) - accumulate blocks and submit together
+# Set to 0 to submit every block immediately (not recommended)
+batch_interval_ms = 5000
+
+# Maximum batch size (bytes) - triggers early submission if exceeded
+# Default: 1.5MB (well under Celestia's ~2MB blob limit)
+max_batch_size_bytes = 1500000
+
+# ------------------------------------------------------------------------------
+# DA Sync Configuration (for new validators joining an existing chain)
+# ------------------------------------------------------------------------------
+# Celestia height where this chain's genesis block was posted.
+# Set to 0 for genesis validators (skip DA sync).
+# New validators should set this to the actual genesis DA height.
+genesis_da_height = 0
+
+# Expected hash of the first sequencer block (optional verification)
+# genesis_block_hash = "0x..."
+
+# Path to the block index (maps sequencer blocks to Celestia heights)
+index_path = "/data/celestia-index"
 
 [execution]
 # reth Engine API
