@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::CelestiaError;
 use crate::Result;
+use sequencer_types::serde_helpers::hex_vec as hex_bytes;
 
 /// Entry in the block index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,26 +197,6 @@ impl BlockIndex {
     /// Get entries in a height range (inclusive).
     pub fn range(&self, start: u64, end: u64) -> impl Iterator<Item = &IndexEntry> {
         self.by_height.range(start..=end).map(|(_, v)| v)
-    }
-}
-
-/// Serde helper for hex-encoded bytes.
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        hex::decode(&s).map_err(serde::de::Error::custom)
     }
 }
 

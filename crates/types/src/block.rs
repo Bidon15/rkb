@@ -6,6 +6,7 @@ use commonware_codec::{extensions::ReadExt as _, Write as CryptoWrite};
 use commonware_cryptography::ed25519;
 use serde::{Deserialize, Serialize};
 
+use crate::serde_helpers::hex_fixed as hex_bytes;
 use crate::Transaction;
 
 /// Hash of a block.
@@ -159,30 +160,6 @@ impl Signature {
         };
 
         public_key.verify(namespace, message, &signature)
-    }
-}
-
-/// Serde helper for hex-encoded fixed-size byte arrays.
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S, const N: usize>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        let len = bytes.len();
-        bytes.try_into().map_err(|_| {
-            serde::de::Error::custom(format!("expected {N} bytes, got {len}"))
-        })
     }
 }
 

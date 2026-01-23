@@ -6,6 +6,7 @@
 
 mod block;
 mod config;
+pub mod serde_helpers;
 mod transaction;
 
 pub use block::{Block, BlockHash, BlockHeader, BlockParams, Signature};
