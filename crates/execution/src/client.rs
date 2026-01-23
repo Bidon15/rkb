@@ -111,11 +111,11 @@ impl ExecutionClient {
     /// Initialize the forkchoice state with the genesis block hash.
     ///
     /// This calls `forkchoiceUpdated` on reth to establish the initial forkchoice,
-    /// which is required before block building can start.
+    /// which is required before block building can start. Retries if reth is syncing.
     ///
     /// # Errors
     ///
-    /// Returns an error if the forkchoice update fails.
+    /// Returns an error if the forkchoice update fails after retries.
     pub async fn init_forkchoice(&self, genesis_hash: B256) -> Result<()> {
         let state = ForkchoiceState {
             head: genesis_hash,
@@ -123,10 +123,127 @@ impl ExecutionClient {
             finalized: genesis_hash,
         };
 
-        // Call forkchoiceUpdated on reth to establish initial state
-        self.update_forkchoice(state).await?;
+        tracing::info!(%genesis_hash, "Initializing forkchoice with genesis...");
 
-        tracing::info!(%genesis_hash, "Forkchoice initialized with genesis on reth");
+        // Retry loop - reth might be starting up
+        let max_retries = 30;
+        let retry_delay = std::time::Duration::from_secs(1);
+
+        for attempt in 1..=max_retries {
+            match self.update_forkchoice(state).await {
+                Ok(()) => {
+                    tracing::info!(%genesis_hash, attempt, "Forkchoice initialized with genesis on reth");
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt < max_retries {
+                        tracing::warn!(
+                            %genesis_hash,
+                            attempt,
+                            max_retries,
+                            error = %e,
+                            "Forkchoice init failed, reth may be starting up. Retrying..."
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
+    /// Apply a built payload to reth and update forkchoice to make it the new HEAD.
+    ///
+    /// This is called after consensus finalizes a block to actually apply it to reth's chain.
+    /// Without this, reth doesn't know about the block and will return SYNCING when trying
+    /// to build the next block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload is invalid or forkchoice update fails.
+    pub async fn apply_built_payload(&self, payload: &BuiltPayload) -> Result<()> {
+        tracing::debug!(
+            block_number = payload.block_number,
+            %payload.block_hash,
+            "Applying built payload to reth"
+        );
+
+        // Reconstruct ExecutionPayloadV3 from BuiltPayload
+        let v1 = ExecutionPayloadV1 {
+            parent_hash: payload.parent_hash,
+            fee_recipient: payload.fee_recipient,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: alloy_primitives::Bloom::from_slice(&payload.logs_bloom),
+            prev_randao: payload.parent_hash, // Use parent hash as prev_randao for PoA
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: Bytes::new(),
+            base_fee_per_gas: U256::from(payload.base_fee_per_gas),
+            block_hash: payload.block_hash,
+            transactions: payload.transactions.clone(),
+        };
+
+        let v2 = ExecutionPayloadV2 {
+            payload_inner: v1,
+            withdrawals: vec![], // No withdrawals in PoA
+        };
+
+        let execution_payload = ExecutionPayloadV3 {
+            payload_inner: v2,
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+
+        // Call engine_newPayloadV3 to validate and import the block
+        let response: PayloadStatus = self
+            .client
+            .request(
+                "engine_newPayloadV3",
+                rpc_params![execution_payload, Vec::<B256>::new(), B256::ZERO],
+            )
+            .await
+            .map_err(|e| ExecutionError::ExecutionFailed(format!("newPayload RPC failed: {e}")))?;
+
+        tracing::debug!(
+            ?response.status,
+            latest_valid_hash = ?response.latest_valid_hash,
+            "engine_newPayloadV3 response for built payload"
+        );
+
+        match response.status {
+            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted => {
+                // Block imported successfully, now update forkchoice
+            }
+            PayloadStatusEnum::Syncing => {
+                // Reth is processing - this is ok, forkchoice update will complete it
+                tracing::debug!("newPayload returned SYNCING, proceeding with forkchoice update");
+            }
+            PayloadStatusEnum::Invalid { ref validation_error } => {
+                return Err(ExecutionError::InvalidBlock(validation_error.clone()));
+            }
+        }
+
+        // Update forkchoice to make this block the new HEAD
+        let new_state = ForkchoiceState {
+            head: payload.block_hash,
+            safe: payload.block_hash,
+            finalized: self.forkchoice.read().await.finalized,
+        };
+
+        self.update_forkchoice(new_state).await?;
+
+        tracing::info!(
+            block_number = payload.block_number,
+            %payload.block_hash,
+            "Built payload applied to reth and forkchoice updated"
+        );
+
         Ok(())
     }
 
@@ -318,15 +435,19 @@ impl BlockBuilder for ExecutionClient {
                 ExecutionError::ForkchoiceFailed(format!("forkchoiceUpdated RPC failed: {e}"))
             })?;
 
-        tracing::debug!(
-            ?response.payload_status.status,
+        tracing::info!(
+            status = ?response.payload_status.status,
             payload_id = ?response.payload_id,
+            latest_valid_hash = ?response.payload_status.latest_valid_hash,
+            head = %parent_hash,
+            safe = %current.safe,
+            finalized = %current.finalized,
             "engine_forkchoiceUpdatedV3 response (with payload attributes)"
         );
 
         match response.payload_status.status {
-            PayloadStatusEnum::Valid | PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => {
-                // Extract payload ID
+            PayloadStatusEnum::Valid => {
+                // Only VALID status returns a payload ID
                 let payload_id = response.payload_id.ok_or_else(|| {
                     ExecutionError::ForkchoiceFailed(
                         "forkchoiceUpdated returned no payload ID".to_string(),
@@ -342,8 +463,23 @@ impl BlockBuilder for ExecutionClient {
                 // Convert from alloy PayloadId to our PayloadId
                 Ok(PayloadId::from_bytes(payload_id.0.into()))
             }
+            PayloadStatusEnum::Syncing => {
+                // Reth is syncing - can't build blocks yet
+                Err(ExecutionError::ForkchoiceFailed(
+                    "reth is syncing, cannot build blocks yet".to_string(),
+                ))
+            }
+            PayloadStatusEnum::Accepted => {
+                // Accepted but not validated - unusual for block building
+                Err(ExecutionError::ForkchoiceFailed(
+                    "forkchoice accepted but not validated, cannot build".to_string(),
+                ))
+            }
             PayloadStatusEnum::Invalid { ref validation_error } => {
-                Err(ExecutionError::ForkchoiceFailed(validation_error.clone()))
+                Err(ExecutionError::ForkchoiceFailed(format!(
+                    "invalid forkchoice: {}",
+                    validation_error
+                )))
             }
         }
     }

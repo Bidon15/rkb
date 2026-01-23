@@ -315,15 +315,23 @@ impl Application {
 
     /// Finalize a block and update state.
     ///
+    /// This applies the block to reth via newPayloadV3 and updates forkchoice.
     /// Uses reth's authoritative block hash from the payload if available.
-    pub fn finalize(&mut self, digest: AppDigest) -> Option<Block> {
+    pub async fn finalize(&mut self, digest: AppDigest) -> Option<Block> {
         if let Some(block) = self.pending_blocks.remove(&digest) {
-            // Get reth's authoritative block hash from payload, or compute from header
-            let block_hash = self
-                .pending_payloads
-                .remove(&digest)
-                .map(|p| p.block_hash)
-                .unwrap_or_else(|| block.hash());
+            // Get the payload - we need it to apply to reth
+            let payload = self.pending_payloads.remove(&digest);
+            let block_hash = payload.as_ref().map(|p| p.block_hash).unwrap_or_else(|| block.hash());
+
+            // Apply the payload to reth so it updates its chain
+            if let Some(ref payload) = payload {
+                if let Err(e) = self.execution.apply_built_payload(payload).await {
+                    tracing::error!(?e, "Failed to apply built payload to reth");
+                    // Still finalize locally - consensus agreed on this block
+                }
+            } else {
+                tracing::warn!("No payload found for finalized block, reth may be out of sync");
+            }
 
             self.height = block.height() + 1;
             self.last_hash = block_hash;
@@ -383,7 +391,7 @@ impl Application {
                     self.broadcast(payload);
                 }
                 Message::Finalize { digest } => {
-                    self.finalize(digest);
+                    self.finalize(digest).await;
                 }
             }
         }
