@@ -12,16 +12,16 @@ Celestia  → Data availability, firm finality
 
 This project maintains minimal code by delegating to proven systems:
 
-| Responsibility       | Delegated To         | Our Code          |
-| -------------------- | -------------------- | ----------------- |
-| Transaction ordering | reth mempool         | 0 lines           |
-| Block building       | reth Engine API      | ~50 lines         |
-| EVM execution        | reth                 | 0 lines           |
-| BFT consensus        | commonware-consensus | ~200 lines glue   |
-| Data availability    | Celestia             | ~300 lines client |
-| P2P networking       | commonware-p2p       | ~100 lines config |
+| Responsibility       | Delegated To         | Our Code            |
+| -------------------- | -------------------- | ------------------- |
+| Transaction ordering | reth mempool         | 0 lines             |
+| Block building       | reth Engine API      | ~1,200 lines        |
+| EVM execution        | reth                 | 0 lines             |
+| BFT consensus        | commonware-consensus | ~1,800 lines        |
+| Data availability    | Celestia             | ~1,300 lines        |
+| Orchestration        | -                    | ~2,100 lines        |
 
-**Total: ~3,000 lines of Rust** orchestrating components with millions of lines of battle-tested code.
+**Total: ~6,400 lines of Rust** orchestrating components with millions of lines of battle-tested code.
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Astria Sequencer is a Celestia-native PoA EVM sequencer. You maintain ~3,000 lines of plumbing between Commonware (consensus), Reth (execution), and Celestia (DA).
+RKB (Rauh-Konsens Begriff) is a Celestia-native PoA EVM sequencer. You maintain ~6,400 lines of plumbing between Commonware (consensus), Reth (execution), and Celestia (DA).
 
 ---
 
@@ -12,17 +12,17 @@ Astria Sequencer is a Celestia-native PoA EVM sequencer. You maintain ~3,000 lin
 │  COMPLEXITY YOU INHERIT          COMPLEXITY YOU OWN             │
 │  (don't touch)                   (your problem)                 │
 │                                                                  │
-│  • BFT consensus (~15k LoC)      • Wiring components (~3,000)   │
+│  • BFT consensus (~15k LoC)      • Wiring components (~6,400)   │
 │  • P2P networking (~10k LoC)     • Config management            │
 │  • EVM execution (~200k LoC)     • Batch timing                 │
 │  • Celestia protocol (~20k LoC)  • Finality state machine       │
 │                                                                  │
-│  ~300,000+ lines                 ~3,000 lines                   │
+│  ~300,000+ lines                 ~6,400 lines                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-When something breaks, first ask: **"Is this my 3,000 lines or their 300,000?"**
+When something breaks, first ask: **"Is this my 6,400 lines or their 300,000?"**
 
 ---
 
