@@ -10,7 +10,7 @@ This document explains what you're maintaining, what you're not, and where the a
 - [What You Maintain vs What You Don't](#what-you-maintain-vs-what-you-dont)
 - [Lines of Code Breakdown](#lines-of-code-breakdown)
 - [Sequence Diagrams](#sequence-diagrams)
-  - [Block Production](#block-production)
+  - [Block Production (Vanilla Ethereum)](#block-production-vanilla-ethereum)
   - [Celestia Submission](#celestia-submission)
   - [Finality Tracking](#finality-tracking)
   - [Full Transaction Lifecycle](#full-transaction-lifecycle)
@@ -26,15 +26,17 @@ This repo is **plumbing**. It connects three production-grade systems:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                  │
-│   COMMONWARE          YOUR CODE           RETH                  │
-│   (consensus)    ──→  (plumbing)    ──→   (execution)           │
-│                           │                                      │
-│                           ▼                                      │
-│                       CELESTIA                                   │
-│                       (DA)                                       │
+│   USER TX ──► RETH          YOUR CODE         CELESTIA          │
+│              (mempool)  ──►  (plumbing)   ──►  (DA)             │
+│              (builder)           │                               │
+│                                  ▼                               │
+│                            COMMONWARE                            │
+│                            (consensus)                           │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**Key insight:** Users send transactions directly to reth. We don't maintain a mempool.
 
 **Your job:** Keep the pipes connected. The heavy lifting happens in libraries you don't maintain.
 
@@ -44,11 +46,13 @@ This repo is **plumbing**. It connects three production-grade systems:
 
 | Component | Maintainer | Your Responsibility |
 |-----------|------------|---------------------|
-| **Commonware** | Commonware team | Use their APIs correctly |
-| **Reth** | Paradigm | Call Engine API correctly |
-| **Celestia/Lumina** | Celestia team | Submit blobs correctly |
-| **RSP** (future) | Succinct | Feed it block data |
-| **This repo** | You | ~1500 lines of glue |
+| **Reth mempool** | Paradigm | 0 lines (they handle it) |
+| **Reth block building** | Paradigm | ~50 lines (call Engine API) |
+| **Reth EVM execution** | Paradigm | 0 lines (they handle it) |
+| **Commonware consensus** | Commonware team | ~200 lines glue |
+| **Commonware P2P** | Commonware team | ~100 lines config |
+| **Celestia/Lumina** | Celestia team | ~300 lines client |
+| **This repo** | You | ~5,000 lines of glue |
 
 **Translation:** When consensus breaks, it's probably Commonware. When execution breaks, it's probably Reth. When DA breaks, it's probably Celestia. When the glue breaks, it's your code.
 
@@ -60,12 +64,12 @@ This repo is **plumbing**. It connects three production-grade systems:
 
 | Module | Purpose | Approx LoC | Complexity |
 |--------|---------|------------|------------|
-| `src/consensus/` | Wrap Commonware, manage validators | ~300 | Low - config and callbacks |
-| `src/execution/` | Engine API client to Reth | ~400 | Medium - state tracking |
-| `src/celestia/` | Blob submission, finality tracking | ~300 | Medium - async coordination |
-| `src/types/` | Block, transaction, config structs | ~200 | Low - data definitions |
-| `src/main.rs` | CLI, startup, main loop | ~200 | Low - orchestration |
-| **Total** | | **~1400** | |
+| `crates/consensus/` | Wrap Commonware, Application trait | ~500 | Low - callbacks |
+| `crates/execution/` | Engine API client, BlockBuilder | ~500 | Medium - state tracking |
+| `crates/celestia/` | Blob submission, finality tracking | ~800 | Medium - async coordination |
+| `crates/types/` | Block, transaction, config structs | ~300 | Low - data definitions |
+| `crates/sequencer/` | CLI, startup, main loop | ~500 | Low - orchestration |
+| **Total** | | **~2,600** | |
 
 ### What You Didn't Write (But Use)
 
@@ -77,49 +81,77 @@ This repo is **plumbing**. It connects three production-grade systems:
 | Lumina | ~20,000+ | 0% |
 | Alloy types | ~50,000+ | 0% |
 
-**The ratio:** You maintain ~1,400 lines. You depend on ~300,000+ lines. That's the point.
+**The ratio:** You maintain ~2,600 lines. You depend on ~300,000+ lines. That's the point.
 
 ---
 
 ## Sequence Diagrams
 
-### Block Production
+### Block Production (Vanilla Ethereum)
+
+**This is the key architectural insight.** We don't build blocks—reth does.
 
 ```
-┌──────────┐     ┌───────────┐     ┌──────────┐     ┌──────┐
-│  User    │     │ Sequencer │     │Commonware│     │ Reth │
-└────┬─────┘     └─────┬─────┘     └────┬─────┘     └──┬───┘
-     │                 │                │              │
-     │  Submit Tx      │                │              │
-     │────────────────>│                │              │
-     │                 │                │              │
-     │                 │  Add to mempool│              │
-     │                 │───────────────>│              │
-     │                 │                │              │
-     │                 │                │  (PoA round) │
-     │                 │                │──────────────│
-     │                 │                │              │
-     │                 │  Block ready   │              │
-     │                 │<───────────────│              │
-     │                 │                │              │
-     │                 │  engine_newPayloadV3         │
-     │                 │──────────────────────────────>│
-     │                 │                │              │
-     │                 │  PayloadStatus: VALID        │
-     │                 │<──────────────────────────────│
-     │                 │                │              │
-     │                 │  engine_forkchoiceUpdatedV3  │
-     │                 │──────────────────────────────>│
-     │                 │                │              │
-     │                 │  ForkchoiceState updated     │
-     │                 │<──────────────────────────────│
-     │                 │                │              │
-     │  Tx confirmed   │                │              │
-     │<────────────────│                │              │
-     │  (soft finality)│                │              │
+┌──────┐     ┌──────┐     ┌───────────┐     ┌───────────┐
+│ User │     │ Reth │     │ Sequencer │     │Commonware │
+└──┬───┘     └──┬───┘     └─────┬─────┘     └─────┬─────┘
+   │            │               │                 │
+   │ eth_sendRawTransaction     │                 │
+   │───────────>│               │                 │
+   │            │               │                 │
+   │            │ (tx in mempool)                 │
+   │            │               │                 │
+   │            │               │  (Leader elected)
+   │            │               │<────────────────│
+   │            │               │                 │
+   │            │  forkchoiceUpdatedV3           │
+   │            │  + PayloadAttributes           │
+   │            │<──────────────│                 │
+   │            │               │                 │
+   │            │  PayloadId    │                 │
+   │            │──────────────>│                 │
+   │            │               │                 │
+   │            │  (reth builds block            │
+   │            │   from mempool)                │
+   │            │               │                 │
+   │            │  getPayloadV3 │                 │
+   │            │<──────────────│                 │
+   │            │               │                 │
+   │            │  BuiltPayload │                 │
+   │            │  (block_hash, │                 │
+   │            │   state_root, │                 │
+   │            │   txs...)     │                 │
+   │            │──────────────>│                 │
+   │            │               │                 │
+   │            │               │  Propose block  │
+   │            │               │  (reth's hash)  │
+   │            │               │────────────────>│
+   │            │               │                 │
+   │            │               │  2/3 votes      │
+   │            │               │  (notarized)    │
+   │            │               │<────────────────│
+   │            │               │                 │
+   │            │  newPayloadV3 │ (all validators)
+   │            │<──────────────│                 │
+   │            │               │                 │
+   │            │  VALID        │                 │
+   │            │──────────────>│                 │
+   │            │               │                 │
+   │ Tx confirmed (soft finality, ~200ms)        │
+   │<───────────│               │                 │
 ```
 
-**Your code:** The middle column. You're calling Commonware and Reth APIs.
+**Your code:** The Sequencer column. You call reth's Engine API to:
+1. Start building (`forkchoiceUpdatedV3` with `PayloadAttributes`)
+2. Get the built block (`getPayloadV3`)
+3. Execute agreed blocks (`newPayloadV3`)
+
+**You don't write:**
+- Mempool logic (reth)
+- Transaction ordering (reth)
+- Gas accounting (reth)
+- State root computation (reth)
+- BFT consensus (Commonware)
 
 ---
 
@@ -130,7 +162,8 @@ This repo is **plumbing**. It connects three production-grade systems:
 │ Sequencer │     │ BatchBuffer │     │ Lumina  │     │ Celestia │
 └─────┬─────┘     └──────┬──────┘     └────┬────┘     └────┬─────┘
       │                  │                 │               │
-      │  Block executed  │                 │               │
+      │  Block finalized │                 │               │
+      │  (soft)          │                 │               │
       │─────────────────>│                 │               │
       │                  │                 │               │
       │                  │  (accumulate    │               │
@@ -142,16 +175,16 @@ This repo is **plumbing**. It connects three production-grade systems:
       │                  │  Batch ready    │               │
       │                  │  (timeout/size) │               │
       │                  │                 │               │
-      │                  │  Submit blob    │               │
+      │                  │  submit_blocks()│               │
       │                  │────────────────>│               │
       │                  │                 │               │
-      │                  │                 │  blob.submit()│
+      │                  │                 │  PayForBlobs  │
       │                  │                 │──────────────>│
       │                  │                 │               │
       │                  │                 │  TxInfo       │
       │                  │                 │<──────────────│
       │                  │                 │               │
-      │                  │  Commitment     │               │
+      │                  │  BlobSubmission │               │
       │                  │<────────────────│               │
       │                  │                 │               │
       │  Batch submitted │                 │               │
@@ -196,7 +229,7 @@ This repo is **plumbing**. It connects three production-grade systems:
       │  FirmConfirmation  │                   │             │
       │<───────────────────│                   │             │
       │                    │                   │             │
-      │  engine_forkchoiceUpdatedV3           │             │
+      │  forkchoiceUpdatedV3                   │             │
       │  (update FINALIZED)                    │             │
       │────────────────────────────────────────────────────>│
       │                    │                   │             │
@@ -209,90 +242,99 @@ This repo is **plumbing**. It connects three production-grade systems:
 ### Full Transaction Lifecycle
 
 ```
-┌──────┐  ┌───────────┐  ┌───────────┐  ┌──────┐  ┌─────────┐  ┌──────────┐
-│ User │  │ Sequencer │  │Commonware │  │ Reth │  │ Lumina  │  │ Celestia │
-└──┬───┘  └─────┬─────┘  └─────┬─────┘  └──┬───┘  └────┬────┘  └────┬─────┘
-   │            │              │           │           │            │
-   │ 1. Submit  │              │           │           │            │
-   │───────────>│              │           │           │            │
-   │            │              │           │           │            │
-   │            │ 2. Order     │           │           │            │
-   │            │─────────────>│           │           │            │
-   │            │              │           │           │            │
-   │            │ 3. Block     │           │           │            │
-   │            │<─────────────│           │           │            │
-   │            │              │           │           │            │
-   │            │ 4. Execute   │           │           │            │
-   │            │─────────────────────────>│           │            │
-   │            │              │           │           │            │
-   │ 5. SOFT ✓  │              │           │           │            │
-   │<───────────│ (~200ms)     │           │           │            │
-   │            │              │           │           │            │
-   │            │ 6. Batch     │           │           │            │
-   │            │─────────────────────────────────────>│            │
-   │            │              │           │           │            │
-   │            │              │           │ 7. Submit │            │
-   │            │              │           │           │───────────>│
-   │            │              │           │           │            │
-   │            │              │           │ 8. Commit │            │
-   │            │              │           │<──────────│            │
-   │            │              │           │           │            │
-   │ 9. DA ✓    │              │           │           │            │
-   │<───────────│ (~6s)        │           │           │            │
-   │            │              │           │           │            │
-   │            │              │           │10. Header │            │
-   │            │              │           │<──────────│            │
-   │            │              │           │           │            │
-   │            │ 11. Update   │           │           │            │
-   │            │    FINALIZED │           │           │            │
-   │            │─────────────────────────>│           │            │
-   │            │              │           │           │            │
-   │12. FIRM ✓  │              │           │           │            │
-   │<───────────│ (~6s)        │           │           │            │
+┌──────┐  ┌──────┐  ┌───────────┐  ┌───────────┐  ┌─────────┐  ┌──────────┐
+│ User │  │ Reth │  │ Sequencer │  │Commonware │  │ Lumina  │  │ Celestia │
+└──┬───┘  └──┬───┘  └─────┬─────┘  └─────┬─────┘  └────┬────┘  └────┬─────┘
+   │         │            │              │             │            │
+   │ 1. Send │            │              │             │            │
+   │────────>│            │              │             │            │
+   │         │            │              │             │            │
+   │         │ (mempool)  │              │             │            │
+   │         │            │              │             │            │
+   │         │            │ 2. Leader    │             │            │
+   │         │            │    elected   │             │            │
+   │         │            │<─────────────│             │            │
+   │         │            │              │             │            │
+   │         │ 3. Start   │              │             │            │
+   │         │    build   │              │             │            │
+   │         │<───────────│              │             │            │
+   │         │            │              │             │            │
+   │         │ 4. Payload │              │             │            │
+   │         │───────────>│              │             │            │
+   │         │            │              │             │            │
+   │         │            │ 5. Propose   │             │            │
+   │         │            │─────────────>│             │            │
+   │         │            │              │             │            │
+   │         │            │ 6. Notarize  │             │            │
+   │         │            │<─────────────│             │            │
+   │         │            │              │             │            │
+   │         │ 7. Execute │              │             │            │
+   │         │<───────────│ (all nodes)  │             │            │
+   │         │            │              │             │            │
+   │ 8. SOFT ✓│           │              │             │            │
+   │<────────│ (~200ms)   │              │             │            │
+   │         │            │              │             │            │
+   │         │            │ 9. Batch     │             │            │
+   │         │            │─────────────────────────────────────────>│
+   │         │            │              │             │            │
+   │         │            │              │  10. Header │            │
+   │         │            │              │<────────────│            │
+   │         │            │              │             │            │
+   │         │            │ 11. Update   │             │            │
+   │         │            │    FINALIZED │             │            │
+   │         │<───────────│              │             │            │
+   │         │            │              │             │            │
+   │12. FIRM ✓│           │              │             │            │
+   │<────────│ (~6s)      │              │             │            │
 ```
 
-**Your code:** Steps 2-4 (consensus→execution glue), 6-8 (batching→submission), 10-11 (finality tracking).
+**Your code:** Steps 2-7 (consensus↔reth glue), 9 (batching), 10-11 (finality tracking).
+
+**Not your code:** Step 1 (reth mempool), Step 8 (reth state), Celestia protocol.
 
 ---
 
 ## Component Responsibilities
 
-### `src/consensus/mod.rs`
+### `crates/consensus/application.rs`
 
 **What it does:**
-- Initialize Commonware with validator config
-- Receive blocks from consensus
-- Forward to execution
+- Implement `Automaton` trait for Commonware
+- Call `execution.start_building()` to trigger reth block building
+- Call `execution.get_payload()` to retrieve built block
+- Return reth's authoritative block hash to consensus
 
 **What it doesn't do:**
+- Build blocks (reth does this)
+- Order transactions (reth does this)
+- Compute state roots (reth does this)
 - BFT logic (Commonware)
-- P2P networking (Commonware)
-- Cryptographic signing (Commonware)
 
 ---
 
-### `src/execution/mod.rs`
+### `crates/execution/client.rs`
 
 **What it does:**
-- Build `ExecutionPayload` from blocks
-- Call `engine_newPayloadV3`
-- Call `engine_forkchoiceUpdatedV3`
-- Track HEAD/SAFE/FINALIZED
+- `start_building()` - Call `forkchoiceUpdatedV3` with `PayloadAttributes`
+- `get_payload()` - Call `getPayloadV3` to retrieve built block
+- `execute_block()` - Call `newPayloadV3` to execute consensus blocks
+- `update_forkchoice()` - Track HEAD/SAFE/FINALIZED
 
 **What it doesn't do:**
 - EVM execution (Reth)
 - State storage (Reth)
-- JSON-RPC serving (Reth)
+- Mempool management (Reth)
+- Transaction validation (Reth)
 
 ---
 
-### `src/celestia/mod.rs`
+### `crates/celestia/client.rs`
 
 **What it does:**
-- Batch blocks into blobs
-- Submit via Lumina
-- Track pending submissions
-- Match Celestia headers to finality
+- `submit_blocks()` - Batch blocks into single PayForBlobs tx
+- `run_finality_tracker()` - Subscribe to Celestia headers
+- Match headers to pending submissions
+- Emit `FinalityConfirmation` events
 
 **What it doesn't do:**
 - Celestia protocol (Lumina)
@@ -301,28 +343,17 @@ This repo is **plumbing**. It connects three production-grade systems:
 
 ---
 
-### `src/types/mod.rs`
+### `crates/sequencer/simplex_sequencer.rs`
 
 **What it does:**
-- Define `Block`, `Transaction`, `Config`
-- Serialization for blobs
-- Type conversions
+- Initialize reth connection, get genesis hash
+- Initialize Celestia connection
+- Spawn batch submission task
+- Wire finalization callback
+- Handle Celestia finality → reth forkchoice updates
 
 **What it doesn't do:**
-- Business logic
-
----
-
-### `src/main.rs`
-
-**What it does:**
-- Parse CLI args
-- Load config
-- Wire components together
-- Run main loop
-
-**What it doesn't do:**
-- Any actual blockchain logic
+- Any blockchain logic (delegates everything)
 
 ---
 
@@ -332,28 +363,33 @@ This repo is **plumbing**. It connects three production-grade systems:
 
 | Symptom | First Check | Likely Cause |
 |---------|-------------|--------------|
+| "Invalid forkchoice state" | Genesis hash | Wrong initial hash |
+| "No payload ID" | forkchoiceUpdated call | Missing init_forkchoice |
 | Blocks not producing | Commonware logs | Consensus issue |
-| Execution errors | Reth logs | Invalid payload or state |
+| Execution errors | Reth logs | Invalid payload |
 | Blobs not landing | Celestia explorer | Lumina connection or gas |
 | Finality stuck | FinalityTracker state | Celestia sync lag |
-| State mismatch | Reth vs Celestia roots | Bug in your code |
 
 ### Debug Sequence
 
 ```
-1. Is Commonware producing blocks?
+1. Is reth accepting forkchoice?
+   └─ No  → Check genesis hash, init_forkchoice called
+   └─ Yes → Continue
+
+2. Is reth returning payloads?
+   └─ No  → Check PayloadAttributes, timestamp
+   └─ Yes → Continue
+
+3. Is Commonware reaching consensus?
    └─ No  → Check validator config, p2p connectivity
    └─ Yes → Continue
 
-2. Is Reth accepting payloads?
-   └─ No  → Check Engine API response, payload format
-   └─ Yes → Continue
-
-3. Are blobs landing on Celestia?
+4. Are blobs landing on Celestia?
    └─ No  → Check Lumina connection, namespace, gas
    └─ Yes → Continue
 
-4. Is finality updating?
+5. Is finality updating?
    └─ No  → Check FinalityTracker, header subscription
    └─ Yes → System healthy
 ```
@@ -368,20 +404,22 @@ This repo is **plumbing**. It connects three production-grade systems:
 │  COMPLEXITY YOU INHERIT          COMPLEXITY YOU OWN             │
 │  (don't touch)                   (your problem)                 │
 │                                                                  │
-│  • BFT consensus                 • Wiring components            │
-│  • P2P networking                • Config management            │
+│  • Mempool                       • Calling Engine API           │
+│  • Transaction ordering          • Config management            │
 │  • EVM execution                 • Batch timing                 │
 │  • State tries                   • Finality state machine       │
-│  • Celestia protocol             • Error handling               │
-│  • DAS                           • Logging/metrics              │
-│  • ZK circuits (future)          • Blob format                  │
+│  • BFT consensus                 • Error handling               │
+│  • P2P networking                • Logging/metrics              │
+│  • Celestia protocol             • Blob format                  │
+│  • DAS                           • Genesis hash init            │
+│  • ZK circuits (future)                                         │
 │                                                                  │
-│  ~300,000 lines                  ~1,400 lines                   │
+│  ~300,000 lines                  ~2,600 lines                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-When something breaks, first ask: "Is this my 1,400 lines or their 300,000?"
+When something breaks, first ask: "Is this my 2,600 lines or their 300,000?"
 
 Usually it's a configuration issue, not a code issue.
 
@@ -390,7 +428,9 @@ Usually it's a configuration issue, not a code issue.
 ## Summary
 
 - **You maintain plumbing**, not a blockchain
-- **~1,400 lines** of glue code
+- **Users send tx to reth**, not to you
+- **Reth builds blocks**, you just ask for them
+- **~2,600 lines** of glue code
 - **Sequence diagrams** show exactly where your code sits
 - **When debugging**, check the boundaries first
 - **Most complexity** lives in dependencies you don't touch
