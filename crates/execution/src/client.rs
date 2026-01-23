@@ -21,8 +21,11 @@ use crate::{
 
 /// Client for interacting with reth via Engine API.
 pub struct ExecutionClient {
-    /// HTTP client for Engine API calls.
-    client: HttpClient,
+    /// Reth Engine API URL.
+    reth_url: String,
+
+    /// JWT secret for authentication (hex-encoded, without 0x prefix).
+    jwt_secret: String,
 
     /// Current forkchoice state.
     forkchoice: Arc<RwLock<ForkchoiceState>>,
@@ -44,13 +47,27 @@ impl ExecutionClient {
         // Read JWT secret
         let jwt_secret = std::fs::read_to_string(&config.jwt_secret_path)
             .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to read JWT secret: {e}")))?;
-        let jwt_secret = jwt_secret.trim();
+        let jwt_secret = jwt_secret.trim().trim_start_matches("0x").to_string();
 
-        // Build JWT token (HS256)
-        let jwt_token = crate::jwt::build_token(jwt_secret)
+        // Validate the secret by building a test token
+        crate::jwt::build_token(&jwt_secret)
+            .map_err(|e| ExecutionError::ConnectionFailed(format!("invalid JWT secret: {e}")))?;
+
+        Ok(Self {
+            reth_url: config.reth_url,
+            jwt_secret,
+            forkchoice: Arc::new(RwLock::new(ForkchoiceState::default())),
+        })
+    }
+
+    /// Build an HTTP client with a fresh JWT token.
+    ///
+    /// The Engine API requires the JWT `iat` claim to be within 60 seconds
+    /// of the current time. This method generates a fresh token for each call.
+    fn client(&self) -> Result<HttpClient> {
+        let jwt_token = crate::jwt::build_token(&self.jwt_secret)
             .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to build JWT: {e}")))?;
 
-        // Build HTTP client with Authorization header
         let mut headers = HeaderMap::new();
         headers.insert(
             "Authorization",
@@ -58,15 +75,10 @@ impl ExecutionClient {
                 .map_err(|e| ExecutionError::ConnectionFailed(format!("invalid header value: {e}")))?,
         );
 
-        let client = HttpClientBuilder::default()
+        HttpClientBuilder::default()
             .set_headers(headers)
-            .build(&config.reth_url)
-            .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to build HTTP client: {e}")))?;
-
-        Ok(Self {
-            client,
-            forkchoice: Arc::new(RwLock::new(ForkchoiceState::default())),
-        })
+            .build(&self.reth_url)
+            .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to build HTTP client: {e}")))
     }
 
     /// Get the genesis block hash from reth.
@@ -84,7 +96,7 @@ impl ExecutionClient {
         }
 
         let response: BlockResponse = self
-            .client
+            .client()?
             .request("eth_getBlockByNumber", rpc_params!["0x0", false])
             .await
             .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to get genesis: {e}")))?;
@@ -93,20 +105,23 @@ impl ExecutionClient {
         Ok(response.hash)
     }
 
-    /// Get reth's current head block hash and number.
+    /// Get reth's current head block hash, number, and timestamp.
     ///
     /// This queries `eth_getBlockByNumber("latest")` to get reth's actual
-    /// chain head. Used for sync-aware proposals to verify our state matches reth.
+    /// chain head. Used for sync-aware proposals to verify our state matches reth,
+    /// and to ensure new block timestamps are strictly greater than the parent.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn get_head(&self) -> Result<(B256, u64)> {
+    pub async fn get_head(&self) -> Result<(B256, u64, u64)> {
         #[derive(serde::Deserialize)]
         struct BlockResponse {
             hash: B256,
             #[serde(deserialize_with = "deserialize_u64_hex")]
             number: u64,
+            #[serde(deserialize_with = "deserialize_u64_hex")]
+            timestamp: u64,
         }
 
         /// Deserialize a hex string (with 0x prefix) to u64
@@ -120,12 +135,12 @@ impl ExecutionClient {
         }
 
         let response: BlockResponse = self
-            .client
+            .client()?
             .request("eth_getBlockByNumber", rpc_params!["latest", false])
             .await
             .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to get head: {e}")))?;
 
-        Ok((response.hash, response.number))
+        Ok((response.hash, response.number, response.timestamp))
     }
 
     /// Initialize the forkchoice state with the genesis block hash.
@@ -195,7 +210,7 @@ impl ExecutionClient {
 
         // Call engine_newPayloadV3 to validate and import the block
         let response: PayloadStatus = self
-            .client
+            .client()?
             .request(
                 "engine_newPayloadV3",
                 rpc_params![execution_payload, Vec::<B256>::new(), B256::ZERO],
@@ -302,7 +317,7 @@ impl Execution for ExecutionClient {
         // Call engine_newPayloadV3
         // Parameters: payload, versioned_hashes (empty for non-blob txs), parent_beacon_block_root
         let response: PayloadStatus = self
-            .client
+            .client()?
             .request(
                 "engine_newPayloadV3",
                 rpc_params![payload, Vec::<B256>::new(), B256::ZERO],
@@ -358,7 +373,7 @@ impl Execution for ExecutionClient {
         // Call engine_forkchoiceUpdatedV3
         // Parameters: forkchoice_state, payload_attributes (None = no new block)
         let response: ForkchoiceUpdated = self
-            .client
+            .client()?
             .request(
                 "engine_forkchoiceUpdatedV3",
                 rpc_params![engine_state, Option::<()>::None],
@@ -387,7 +402,7 @@ impl Execution for ExecutionClient {
 
 #[async_trait::async_trait]
 impl BlockBuilder for ExecutionClient {
-    async fn get_head(&self) -> Result<(B256, u64)> {
+    async fn get_head(&self) -> Result<(B256, u64, u64)> {
         // Delegate to inherent method
         Self::get_head(self).await
     }
@@ -403,7 +418,7 @@ impl BlockBuilder for ExecutionClient {
 
         // Call engine_newPayloadV3 to import (NOT finalize) the block
         let response: PayloadStatus = self
-            .client
+            .client()?
             .request(
                 "engine_newPayloadV3",
                 rpc_params![execution_payload, Vec::<B256>::new(), B256::ZERO],
@@ -473,7 +488,7 @@ impl BlockBuilder for ExecutionClient {
 
         // Call forkchoiceUpdated with payload attributes to start building
         let response: ForkchoiceUpdated = self
-            .client
+            .client()?
             .request(
                 "engine_forkchoiceUpdatedV3",
                 rpc_params![engine_state, Some(payload_attributes)],
@@ -540,7 +555,7 @@ impl BlockBuilder for ExecutionClient {
 
         // Call getPayloadV3
         let response: ExecutionPayloadEnvelopeV3 = self
-            .client
+            .client()?
             .request("engine_getPayloadV3", rpc_params![engine_payload_id])
             .await
             .map_err(|e| ExecutionError::ExecutionFailed(format!("getPayload RPC failed: {e}")))?;

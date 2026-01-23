@@ -54,13 +54,14 @@ pub trait Execution: Send + Sync {
 pub trait BlockBuilder: Send + Sync {
     /// Get reth's current head block.
     ///
-    /// Returns the (hash, number) of reth's chain head. Used for sync-aware
-    /// proposals to verify consensus state matches execution state.
+    /// Returns the (hash, number, timestamp) of reth's chain head. Used for:
+    /// - Sync-aware proposals to verify consensus state matches execution state
+    /// - Ensuring new block timestamps are strictly greater than parent
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    async fn get_head(&self) -> Result<(B256, u64)>;
+    async fn get_head(&self) -> Result<(B256, u64, u64)>;
 
     /// Import a payload to reth without updating forkchoice.
     ///
