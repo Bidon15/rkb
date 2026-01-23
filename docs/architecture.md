@@ -19,9 +19,10 @@ Transactions → Consensus → Execution → Celestia
 ## Finality Model
 
 - **Soft Confirmation**: Immediate on PoA consensus
-- **Firm Confirmation**: ~12s on Celestia finality
+- **Firm Confirmation**: ~6s on Celestia finality
 
 Maps to Ethereum forkchoice:
+
 - `HEAD` = Latest soft-confirmed block
 - `SAFE` = Same as HEAD (PoA is authoritative)
 - `FINALIZED` = Latest Celestia-finalized block

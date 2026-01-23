@@ -56,27 +56,22 @@ This creates:
 
 Each validator needs its own funded Celestia account because any validator can become the leader and submit blobs.
 
-**You must fund 3 separate addresses:**
-
+**Get addresses:**
+```bash
+cargo build --release -p sequencer
+../target/release/sequencer celestia-address --key keys/celestia-0.key
+../target/release/sequencer celestia-address --key keys/celestia-1.key
+../target/release/sequencer celestia-address --key keys/celestia-2.key
 ```
-celestia-0.key → Address for Validator 0
-celestia-1.key → Address for Validator 1
-celestia-2.key → Address for Validator 2
-```
 
-Steps:
-1. Get the address from each `celestia-*.key` (secp256k1 private key)
-2. Visit the Mocha faucet: https://faucet.celestia-mocha.com/
-3. Request testnet TIA tokens for **each** address
-4. Verify all 3 accounts have sufficient balance before starting
+**Fund all 3 at:** https://faucet.celestia-mocha.com/
 
 **Why 3 keys?** The leader rotates each block. When Validator 1 is leader, it uses `celestia-1.key` to submit. Without funding, that validator's blob submissions will fail.
 
 ### 3. Start the Network
 
 ```bash
-cd docker
-docker compose up -d
+docker compose up -d --build
 ```
 
 This starts:
@@ -102,30 +97,113 @@ docker compose down
 docker compose down -v
 ```
 
+## Testing & Verification
+
+### Block Production Timeline
+
+```
+Time 0ms:     Leader proposes block
+Time ~100ms:  2/3 validators vote → block notarized (soft finality)
+Time ~200ms:  Block executed on reth, forkchoice updated
+Time 5000ms:  Batch of ~25-50 blocks submitted to Celestia
+Time ~12s:    Celestia includes blob → firm finality
+```
+
+### Verify Consensus is Working
+
+```bash
+# Watch block execution (new blocks every ~100-200ms)
+docker compose logs -f | grep -E "Executing block|executed successfully"
+
+# Check leader rotation
+docker compose logs -f | grep -i "leader"
+```
+
+### Verify Celestia Batching
+
+```bash
+# Watch batch submissions (every 5 seconds)
+docker compose logs -f | grep -i "batch"
+
+# Expected output:
+# "Submitting block batch to Celestia" block_count=25
+# "Block submitted to Celestia"
+# "Block finalized on Celestia"
+```
+
+### Verify reth Execution
+
+```bash
+# Check Engine API calls
+docker compose logs -f validator-0 | grep -i "payload\|forkchoice"
+
+# Expected output:
+# "Executing block via Engine API"
+# "Block executed"
+# "Forkchoice updated with Celestia finality"
+```
+
+### Check Network Health
+
+```bash
+# All services running?
+docker compose ps
+
+# Peer connections (should show 2 peers per validator)
+docker compose logs validator-0 | grep -i "peer"
+
+# Block count
+docker compose logs validator-0 | grep "Block executed" | wc -l
+```
+
 ## Configuration
 
 Each validator has its own config in `docker/config/validator-N/config.toml`.
 
-### Key Configuration Options
+### Consensus Timing
 
 ```toml
 [consensus]
-# All validators must agree on the same validator_seeds
+leader_timeout_ms = 2000       # Wait for leader's proposal
+notarization_timeout_ms = 3000 # Wait for 2/3 votes
+nullify_retry_ms = 10000       # Retry interval for null blocks
+```
+
+### Celestia Batching
+
+```toml
+[celestia]
+# Time-based: submit every N milliseconds
+batch_interval_ms = 5000
+
+# Size-based: submit early if batch exceeds N bytes
+max_batch_size_bytes = 1500000  # 1.5MB
+
+# Gas price for submissions
+gas_price = 0.002
+```
+
+**Batching behavior:**
+- Blocks accumulate until either trigger fires
+- `batch_interval_ms` - time limit (default 5 seconds)
+- `max_batch_size_bytes` - size limit (default 1.5MB)
+- Whichever comes first triggers submission
+
+### P2P Configuration
+
+```toml
+[consensus]
+# All validators must have the same validator_seeds
 validator_seeds = [0, 1, 2]
 
 # Each validator uses its own seed
 validator_seed = 0  # 0, 1, or 2
 
-# P2P peers (other validators)
+# Bootstrap peers (other validators)
 peers = [
     "1@validator-1:26656",
     "2@validator-2:26656",
 ]
-
-# Timeouts
-leader_timeout_ms = 2000      # Time to wait for leader's proposal
-notarization_timeout_ms = 3000 # Time to collect 2/3 votes
-nullify_retry_ms = 10000       # Retry interval for null blocks
 ```
 
 ## How It Works
@@ -141,12 +219,28 @@ nullify_retry_ms = 10000       # Retry interval for null blocks
 2. **Block Production** (2-hop):
    - Leader proposes a block
    - All validators vote
-   - 2/3+ votes = notarized
+   - 2/3+ votes = notarized (soft finality)
 
-3. **Finalization** (3-hop):
-   - Notarized block triggers finalization votes
-   - 2/3+ finalization votes = finalized
-   - Leader submits finalized block to Celestia
+3. **Execution**:
+   - Each validator executes the block on reth
+   - Forkchoice updated (head/safe)
+
+4. **Celestia Submission**:
+   - Leader accumulates blocks in batch
+   - Every 5 seconds (or when size limit hit), submits batch
+   - All blocks in batch share single PayForBlobs transaction
+
+5. **Firm Finality**:
+   - Celestia includes the blob
+   - Finality tracker detects inclusion
+   - Forkchoice updated (finalized)
+
+### Finality Levels
+
+| Level | Trigger | Latency | Guarantees |
+|-------|---------|---------|------------|
+| Soft | 2/3 notarization | ~100-200ms | BFT consensus agreement |
+| Firm | Celestia inclusion | ~6-12s | Data availability proven |
 
 ### Fault Tolerance
 
@@ -159,13 +253,11 @@ With 3 validators (n=3, f=1):
 
 ### Validators Not Connecting
 
-Check P2P connectivity:
 ```bash
+# Check P2P connectivity
 docker compose logs validator-0 | grep -i "peer\|connect"
-```
 
-Verify all validators are on the same Docker network:
-```bash
+# Verify network
 docker network inspect docker_sequencer-net
 ```
 
@@ -173,25 +265,27 @@ docker network inspect docker_sequencer-net
 
 1. Check if Celestia key is funded
 2. Verify RPC/gRPC endpoints are reachable
-3. Check logs for specific errors:
+3. Check logs:
    ```bash
-   docker compose logs validator-0 | grep -i "celestia\|submit"
+   docker compose logs validator-0 | grep -i "celestia\|submit\|failed"
    ```
 
 ### reth Not Starting
 
-Check JWT secret matches:
 ```bash
+# Check JWT secret matches
 cat docker/keys/jwt-0.hex
 docker compose logs reth-0 | grep -i "jwt\|auth"
+
+# Check genesis loaded
+docker compose logs reth-0 | grep -i "genesis\|chain"
 ```
 
-### View Current Block Height
+### No Blocks Being Produced
 
-```bash
-# Check validator logs for finalized blocks
-docker compose logs validator-0 | grep "Block finalized"
-```
+- Need 2/3 validators (2 of 3) online
+- Check all running: `docker compose ps`
+- Check for errors: `docker compose logs | grep -i error`
 
 ## Development
 
@@ -199,7 +293,7 @@ docker compose logs validator-0 | grep "Block finalized"
 
 ```bash
 cargo build --release
-./target/release/sequencer simplex -c config.toml
+./target/release/sequencer run -c config.toml
 ```
 
 ### Running Tests
@@ -215,6 +309,7 @@ To change the number of validators:
 1. Update `validator_seeds` in all configs
 2. Add/remove services in `docker-compose.yml`
 3. Update `peers` in each config to reference all other validators
+4. Generate additional keys with `generate-keys.sh`
 
 ## Network Ports
 

@@ -1,28 +1,25 @@
-# Celestia-native PoA EVM Sequencer
+# RKB (Rauh-Konsens Begriff)
 
-A minimal sequencer stack for PoA EVM chains using Celestia for data availability.
+A raw coordination stack that enforces only minimal mechanical truth.
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Sequencer Node                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │  Consensus  │→→│  Execution  │→→│      Celestia       │ │
-│  │    (PoA)    │  │ (Engine API)│  │  (Lumina Client)    │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-│         ↓               ↓                    ↓              │
-│    Block Prod      reth Node           Blob Submit         │
-└─────────────────────────────────────────────────────────────┘
+Ordering     →  PoA Consensus (commonware-consensus)
+Availability →  Celestia DA (celestia-client)
+Execution    →  reth via Engine API
 ```
 
-## Features
+Three components wired together. No reinvented wheels.
 
-- **PoA Consensus**: Simple block production with configurable validators
-- **Vanilla reth**: Standard Ethereum execution via Engine API
-- **Celestia DA**: Block data stored on Celestia, finality from L1
-- **Two-tier Finality**: Instant soft + ~12s firm confirmation
-- **Custom Native Token**: USDC, TIA, or any token as gas
+## What This Gives You
+
+- Block ordering
+- Data availability
+- EVM execution
+- Nothing else
 
 ## Quick Start
 
@@ -40,54 +37,22 @@ cargo build --release
 ./target/release/sequencer run --config config.toml
 ```
 
-## Configuration
-
-```toml
-[chain]
-chain_id = 1337
-block_time_ms = 1000
-gas_limit = 30000000
-
-[consensus]
-validators = ["0x..."]
-private_key_path = "validator.key"
-
-[celestia]
-submit_endpoint = "http://localhost:26658"
-query_endpoint = "http://localhost:26659"
-namespace = "sequencer"
-
-[execution]
-reth_url = "http://localhost:8551"
-jwt_secret_path = "jwt.hex"
-```
+For multi-validator setups, see [Running a 3-Validator Network](docs/running-3-validator-network.md).
 
 ## Project Structure
 
 ```
 crates/
 ├── sequencer/     # Main binary
-├── consensus/     # PoA block production
-├── celestia/      # Lumina client + finality tracking
-├── execution/     # Engine API client
+├── consensus/     # PoA block production (commonware-consensus)
+├── celestia/      # Celestia DA client + finality tracking
+├── execution/     # Engine API client for reth
 └── types/         # Shared types
 ```
 
-## Development
+## For Builders
 
-```bash
-# Check
-cargo check --workspace
-
-# Test
-cargo test --workspace
-
-# Lint
-cargo clippy --workspace
-
-# Format
-cargo fmt
-```
+This is piping, not policy.
 
 ## License
 
