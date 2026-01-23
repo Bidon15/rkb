@@ -1,16 +1,16 @@
-# RKB: Reth-Kernel-Blob
+# Astria Sequencer
 
 A Celestia-native PoA EVM sequencer. Minimal coordination layer wiring battle-tested components.
 
 ```
-R = Reth      (EVM execution, mempool, block building)
-K = Kernel    (commonware-consensus Simplex BFT)
-B = Blob      (Celestia data availability)
+Reth      → EVM execution, mempool, block building
+Simplex   → BFT consensus (commonware-consensus)
+Celestia  → Data availability, firm finality
 ```
 
 ## Philosophy: Less Code, More Leverage
 
-This project deliberately maintains minimal code by delegating to proven systems:
+This project maintains minimal code by delegating to proven systems:
 
 | Responsibility | Delegated To | Our Code |
 |---------------|--------------|----------|
@@ -21,7 +21,26 @@ This project deliberately maintains minimal code by delegating to proven systems
 | Data availability | Celestia | ~300 lines client |
 | P2P networking | commonware-p2p | ~100 lines config |
 
-**Total: ~5,000 lines of Rust** orchestrating components with millions of lines of battle-tested code.
+**Total: ~3,000 lines of Rust** orchestrating components with millions of lines of battle-tested code.
+
+## Quick Start
+
+```bash
+# Build
+cargo build --release
+
+# Run 3-validator network
+cd docker
+./scripts/generate-keys.sh
+# Copy config.example.toml → config.toml for each validator
+# Fill in your Celestia endpoints
+docker compose up -d --build
+
+# Send transactions to reth (any validator)
+cast send --rpc-url http://localhost:8545 ...
+```
+
+See [Running a 3-Validator Network](docs/running-3-validator-network.md) for detailed setup.
 
 ## Architecture
 
@@ -48,43 +67,24 @@ User Transactions ──► reth mempool ──► reth builds block
                                     └─────────────────┘
 ```
 
-**Key insight**: Users send transactions directly to reth. We don't maintain a mempool.
+**Key insight**: Users send transactions directly to reth. The sequencer has no mempool.
 
-## What This Gives You
+## Finality Model
 
-- **Instant soft finality** (~200ms) via PoA consensus
-- **Firm finality** (~6s) via Celestia inclusion
-- **Full EVM compatibility** (vanilla reth)
-- **No mempool code** (reth handles it)
-- **No block building code** (reth handles it)
-- **No transaction ordering logic** (reth handles it)
-
-## Quick Start
-
-```bash
-# Build
-cargo build --release
-
-# Run 3-validator network (see docker/README.md)
-cd docker
-./scripts/generate-keys.sh
-docker compose up -d --build
-
-# Send transactions to reth (any validator)
-cast send --rpc-url http://localhost:8545 ...
-```
-
-For detailed setup, see [Running a 3-Validator Network](docs/running-3-validator-network.md).
+| Level | Trigger | Latency | Guarantee |
+|-------|---------|---------|-----------|
+| **Soft** | 2/3 BFT notarization | ~200ms | PoA validators agreed |
+| **Firm** | Celestia blob inclusion | ~6s | Data availability proven |
 
 ## Project Structure
 
 ```
 crates/
-├── sequencer/     # Main binary (~1,500 lines)
-├── consensus/     # Simplex BFT glue (~1,200 lines)
-├── celestia/      # DA client + finality (~800 lines)
-├── execution/     # Engine API client (~400 lines)
-└── types/         # Shared types (~300 lines)
+├── sequencer/     # Main binary, CLI, orchestration
+├── consensus/     # Simplex BFT integration (Application trait)
+├── celestia/      # DA client, blob submission, finality tracking
+├── execution/     # reth Engine API client
+└── types/         # Shared types, configuration
 ```
 
 ## How It Works
@@ -100,34 +100,15 @@ crates/
 
 We write none of the complex parts. reth handles EVM. Celestia handles DA. commonware handles BFT.
 
-## Design Decisions
+## Documentation
 
-### Why vanilla reth block building?
-
-Alternative approaches and their costs:
-
-| Approach | Lines of Code | Maintenance Burden |
-|----------|--------------|-------------------|
-| Custom mempool + ordering | ~3,000+ | Transaction validation, nonce tracking, replacement logic |
-| Modified reth (op-reth style) | ~10,000+ | Fork maintenance, merge conflicts |
-| **Vanilla Engine API** | **~50** | **None** |
-
-### Why no sequencer mempool?
-
-- reth already has a production-grade mempool
-- reth already handles nonce ordering
-- reth already handles gas price priority
-- Why reimplement?
-
-### Trade-offs accepted
-
-- Transaction ordering controlled by reth (gas price priority)
-- Leader can theoretically censor (but PoA validators are trusted)
-- No custom ordering schemes (acceptable for PoA)
-
-## For Builders
-
-This is infrastructure, not policy. Build your application logic elsewhere.
+| Document | Description |
+|----------|-------------|
+| [CLAUDE.md](CLAUDE.md) | AI assistant context, crate map, troubleshooting |
+| [Architecture](docs/architecture.md) | Data flow diagrams, design decisions |
+| [Onboarding](docs/onboarding.md) | Sequence diagrams, component responsibilities |
+| [Running 3-Validator Network](docs/running-3-validator-network.md) | Docker setup guide |
+| [Docker README](docker/README.md) | Quick start for local testing |
 
 ## License
 

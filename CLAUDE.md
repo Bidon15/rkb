@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-RKB is a Celestia-native PoA EVM sequencer. You maintain ~1,400 lines of plumbing between Commonware (consensus), Reth (execution), and Celestia (DA).
+Astria Sequencer is a Celestia-native PoA EVM sequencer. You maintain ~3,000 lines of plumbing between Commonware (consensus), Reth (execution), and Celestia (DA).
 
 ---
 
@@ -12,17 +12,17 @@ RKB is a Celestia-native PoA EVM sequencer. You maintain ~1,400 lines of plumbin
 │  COMPLEXITY YOU INHERIT          COMPLEXITY YOU OWN             │
 │  (don't touch)                   (your problem)                 │
 │                                                                  │
-│  • BFT consensus (~15k LoC)      • Wiring components (~1,400)   │
+│  • BFT consensus (~15k LoC)      • Wiring components (~3,000)   │
 │  • P2P networking (~10k LoC)     • Config management            │
 │  • EVM execution (~200k LoC)     • Batch timing                 │
 │  • Celestia protocol (~20k LoC)  • Finality state machine       │
 │                                                                  │
-│  ~300,000+ lines                 ~1,400 lines                   │
+│  ~300,000+ lines                 ~3,000 lines                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-When something breaks, first ask: **"Is this my 1,400 lines or their 300,000?"**
+When something breaks, first ask: **"Is this my 3,000 lines or their 300,000?"**
 
 ---
 
@@ -44,7 +44,7 @@ When something breaks, first ask: **"Is this my 1,400 lines or their 300,000?"**
 **Data Flow:** `Transactions → Consensus → Execution → Celestia`
 
 **Finality:**
-- Soft (~200ms): PoA consensus
+- Soft (~200ms): PoA consensus (2/3 BFT notarization)
 - Firm (~6s): Celestia DA inclusion
 
 ---
@@ -53,9 +53,9 @@ When something breaks, first ask: **"Is this my 1,400 lines or their 300,000?"**
 
 | Crate | Purpose | Key Files |
 |-------|---------|-----------|
-| `sequencer` | CLI + main loop | `main.rs`, `cli.rs`, `simplex_sequencer.rs` |
-| `consensus` | Commonware wrapper | `simplex.rs`, `application.rs`, `runtime.rs` |
-| `execution` | Reth Engine API | `client.rs`, `forkchoice.rs` |
+| `sequencer` | CLI + orchestration | `cli.rs`, `simplex_sequencer.rs` |
+| `consensus` | Simplex BFT wrapper | `application.rs`, `runtime.rs`, `leader.rs` |
+| `execution` | Reth Engine API | `client.rs`, `forkchoice.rs`, `jwt.rs` |
 | `celestia` | Blob submission + finality | `client.rs`, `finality.rs` |
 | `types` | Shared structs | `block.rs`, `config.rs`, `transaction.rs` |
 
@@ -64,22 +64,23 @@ When something breaks, first ask: **"Is this my 1,400 lines or their 300,000?"**
 ## Common Tasks
 
 ### Modify consensus behavior
-→ `crates/consensus/src/simplex.rs` (Simplex BFT integration)
-→ `crates/consensus/src/application.rs` (CertifiableAutomaton impl)
+→ `crates/consensus/src/application.rs` (CertifiableAutomaton impl, block building)
+→ `crates/consensus/src/runtime.rs` (Simplex runtime setup, finalization callback)
 
 ### Fix execution/Engine API issues
-→ `crates/execution/src/client.rs` (newPayload, forkchoiceUpdated calls)
+→ `crates/execution/src/client.rs` (newPayload, forkchoiceUpdated, getPayload calls)
 → `crates/execution/src/forkchoice.rs` (HEAD/SAFE/FINALIZED tracking)
+→ `crates/execution/src/jwt.rs` (JWT token generation for Engine API auth)
 
 ### Debug Celestia submission
-→ `crates/celestia/src/client.rs` (blob submission via Lumina)
+→ `crates/celestia/src/client.rs` (blob submission, PayForBlobs)
 → `crates/celestia/src/finality.rs` (header subscription, finality tracking)
 
 ### Add/modify config options
-→ `crates/types/src/config.rs` (all config structs)
+→ `crates/types/src/config.rs` (all config structs, defaults)
 
-### Add new shared types
-→ `crates/types/src/block.rs` or `transaction.rs`
+### Main orchestration loop
+→ `crates/sequencer/src/simplex_sequencer.rs` (startup, sync, runtime wiring)
 
 ---
 
@@ -87,11 +88,12 @@ When something breaks, first ask: **"Is this my 1,400 lines or their 300,000?"**
 
 | Symptom | First Check | Likely Cause | Fix |
 |---------|-------------|--------------|-----|
-| Blocks not producing | Commonware logs | Validator config, P2P | Check `consensus/src/network.rs` |
-| Engine API errors | Reth logs | Invalid payload, JWT | Check `execution/src/client.rs` |
-| Blobs not landing | Celestia explorer | Gas, namespace | Check `celestia/src/client.rs` |
-| Finality stuck | FinalityTracker | Celestia sync lag | Check `celestia/src/finality.rs` |
-| State root mismatch | Compare roots | Bug in glue code | Diff execution vs Celestia |
+| Blocks not producing | Commonware logs | Validator config, P2P | Check network/peers config |
+| `-38002` Invalid forkchoice | executed_blocks set | Block not on canonical chain | Check `handle_finality_confirmation` |
+| `-38003` Invalid payload | timestamp | `block.timestamp <= parent` | Check `compute_block_timestamp` |
+| JWT auth failures | token expiry | `iat` claim > 60s old | Check `jwt.rs` per-request tokens |
+| Blobs not landing | Celestia explorer | Gas, namespace, account | Check `celestia/src/client.rs` |
+| Duplicate blocks | application state | Multiple proposals same height | Check `last_proposed_height` in application.rs |
 
 ### Debug Sequence
 
@@ -101,11 +103,11 @@ When something breaks, first ask: **"Is this my 1,400 lines or their 300,000?"**
    └─ Yes → continue
 
 2. Reth accepting payloads?
-   └─ No → Engine API response, payload format
+   └─ No → Engine API response, payload format, JWT
    └─ Yes → continue
 
 3. Blobs landing on Celestia?
-   └─ No → Lumina connection, namespace, gas
+   └─ No → Lumina connection, namespace, gas, account funding
    └─ Yes → continue
 
 4. Finality updating?
@@ -132,6 +134,12 @@ cargo fmt --check
 
 # Build release
 cargo build --release
+
+# Run locally
+./target/release/sequencer run -c config.toml
+
+# Get Celestia address from key
+./target/release/sequencer celestia-address --key path/to/key
 ```
 
 ---
@@ -142,8 +150,8 @@ These are external dependencies. If they break, it's not your code:
 
 | If this breaks... | Check here... |
 |-------------------|---------------|
-| Consensus logic | Commonware repo |
-| EVM execution | Reth repo |
+| Consensus logic | commonware-consensus repo |
+| EVM execution | reth repo |
 | Celestia protocol | Lumina/Celestia repos |
 | Engine API types | Alloy repo |
 
@@ -160,31 +168,32 @@ These are external dependencies. If they break, it's not your code:
 
 ### Error Handling
 - `thiserror` for custom error types
-- `eyre::Result` for context-heavy errors
+- Per-crate `Result<T>` type aliases
 - `.context("message")` for error chains
 
 ### Logging
 - `tracing` macros: `info!`, `warn!`, `error!`, `debug!`
-- Structured fields: `info!(block = %height, "produced")`
+- Structured fields: `info!(block_height, %block_hash, "executed")`
 - `RUST_LOG=debug` for verbose output
 
 ### Config
 - TOML files for configuration
 - Serde deserialization
-- Separate `config.rs` per crate
+- Defaults in `types/src/config.rs::defaults` module
 
 ---
 
-## Deep Dives
+## Critical Safety Mechanisms
 
-For detailed documentation, see:
+These prevent production failures:
 
-| Topic | File |
-|-------|------|
-| Full architecture + sequence diagrams | `docs/onboarding.md` |
-| Data flow + finality model | `docs/architecture.md` |
-| Multi-validator setup | `docs/running-3-validator-network.md` |
-| Future ZK verification | `docs/roadmap-zk-verification.md` |
+| Mechanism | Location | Purpose |
+|-----------|----------|---------|
+| `last_proposed_height` | application.rs | Prevents duplicate block proposals at same height |
+| Height check in `finalize()` | application.rs | Rejects stale block finalizations |
+| `executed_blocks` set | simplex_sequencer.rs | Only finalize blocks we've actually executed |
+| Per-request JWT | execution/client.rs | Fresh `iat` claim for each Engine API call |
+| `now.max(parent_timestamp + 1)` | application.rs | Ensures valid block timestamps |
 
 ---
 
@@ -192,16 +201,22 @@ For detailed documentation, see:
 
 ```
 crates/
-├── sequencer/     # Binary entry point, CLI
-├── consensus/     # Commonware PoA/Simplex wrapper
+├── sequencer/     # Binary entry point, CLI, orchestration
+├── consensus/     # Commonware Simplex BFT wrapper
 ├── execution/     # Reth Engine API client
-├── celestia/      # Lumina blob submission + finality
+├── celestia/      # Blob submission + finality tracking
 └── types/         # Shared Block, Transaction, Config
 
 docs/
-├── onboarding.md           # Start here for deep dive
-├── architecture.md         # Data flow diagrams
-└── roadmap-zk-verification.md  # Future ZK work
+├── architecture.md              # Data flow diagrams
+├── onboarding.md                # Sequence diagrams, deep dive
+└── running-3-validator-network.md  # Docker setup
+
+docker/
+├── config/validator-*/config.example.toml  # Template configs
+├── keys/                        # Generated keys (gitignored)
+├── scripts/generate-keys.sh     # Key generation
+└── docker-compose.yml           # 3-validator network
 ```
 
 ---
