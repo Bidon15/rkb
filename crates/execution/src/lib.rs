@@ -7,6 +7,7 @@
 mod client;
 mod error;
 mod forkchoice;
+mod jwt;
 mod payload;
 
 pub use client::ExecutionClient;
