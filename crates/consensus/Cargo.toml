@@ -1,0 +1,37 @@
+[package]
+name = "sequencer-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PoA consensus module using commonware-consensus"
+
+[dependencies]
+sequencer-types.workspace = true
+
+# Commonware consensus
+commonware-codec = "0.0.65"
+commonware-consensus.workspace = true
+commonware-cryptography.workspace = true
+commonware-parallel.workspace = true
+commonware-runtime.workspace = true
+commonware-p2p.workspace = true
+commonware-utils.workspace = true
+
+# Random number generation
+rand.workspace = true
+
+alloy-primitives.workspace = true
+bytes = "1"
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+
+[lints]
+workspace = true

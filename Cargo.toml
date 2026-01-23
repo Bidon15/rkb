@@ -1,0 +1,111 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sequencer",
+    "crates/consensus",
+    "crates/celestia",
+    "crates/execution",
+    "crates/types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/sequencer"
+
+[workspace.dependencies]
+# Internal crates
+sequencer-consensus = { path = "crates/consensus" }
+sequencer-celestia = { path = "crates/celestia" }
+sequencer-execution = { path = "crates/execution" }
+sequencer-types = { path = "crates/types" }
+
+# Commonware (latest)
+commonware-consensus = "0.0.65"
+commonware-p2p = "0.0.65"
+commonware-cryptography = "0.0.65"
+commonware-parallel = "0.0.65"
+commonware-runtime = "0.0.65"
+commonware-storage = "0.0.65"
+commonware-utils = "0.0.65"
+
+# Ed25519 cryptography (fallback)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
+# Ethereum / Execution
+alloy-primitives = { version = "0.8", features = ["serde", "rlp"] }
+alloy-rlp = { version = "0.3", features = ["derive"] }
+alloy-rpc-types-engine = "0.8"
+alloy-consensus = "0.8"
+
+# Celestia (Lumina client for direct gRPC submission)
+celestia-client = "0.4"
+celestia-types = "0.19"
+celestia-rpc = "0.16"
+
+# Async
+tokio = { version = "1.43", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# RPC
+jsonrpsee = { version = "0.24", features = ["http-client", "server"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bincode = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+eyre = "0.6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Crypto
+rand = "0.8"
+hex = "0.4"
+sha3 = "0.10"
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Testing
+proptest = "1"
+rstest = "0.23"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow some pedantic lints
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

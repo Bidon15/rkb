@@ -1,0 +1,18 @@
+[package]
+name = "sequencer-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+commonware-codec = "0.0.65"
+commonware-cryptography.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

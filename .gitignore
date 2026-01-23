@@ -1,0 +1,17 @@
+target/
+plans/
+# dotenv
+.env
+
+# jetbrains
+.idea
+# direnv
+.envrc
+
+# mac os
+.DS_Store
+
+# We don't want to commit the dependency directory of charts
+charts/*/charts
+
+**/__pycache__/
