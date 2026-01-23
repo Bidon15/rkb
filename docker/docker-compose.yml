@@ -1,27 +1,151 @@
-version: '3.8'
+# 3-Validator PoA Sequencer Network
+#
+# This docker-compose sets up a 3-validator Simplex BFT network with:
+# - 3 sequencer instances (validators 0, 1, 2)
+# - 3 reth instances (one per validator)
+# - Internal P2P networking between validators
+#
+# Usage:
+#   docker compose up -d
+#
+# Generate keys first:
+#   ./scripts/generate-keys.sh
 
 services:
-  sequencer:
-    build: ..
+  # ============================================
+  # Validator 0 (seed=0)
+  # ============================================
+  validator-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: validator-0
     volumes:
-      - ./config:/config
-      - ./data:/data
+      - ./config/validator-0:/config:ro
+      - ./keys/validator-0.key:/keys/validator.key:ro
+      - ./keys/celestia.key:/keys/celestia.key:ro
+      - validator-0-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=debug
     ports:
-      - "8545:8545"  # JSON-RPC
-      - "8546:8546"  # WebSocket
+      - "26656:26656"  # P2P
+    networks:
+      - sequencer-net
     depends_on:
-      - reth
+      - reth-0
+    command: ["simplex", "--config", "/config/config.toml"]
 
-  reth:
-    image: ghcr.io/paradigmxyz/reth:latest
+  reth-0:
+    image: ghcr.io/paradigmxyz/reth:v1.3.5
+    container_name: reth-0
     volumes:
-      - ./reth-data:/data
-      - ./jwt.hex:/jwt.hex:ro
-    ports:
-      - "8551:8551"  # Engine API
+      - reth-0-data:/data
+      - ./keys/jwt-0.hex:/jwt.hex:ro
+    networks:
+      - sequencer-net
     command:
       - node
       - --datadir=/data
+      - --chain=dev
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
       - --authrpc.addr=0.0.0.0
       - --authrpc.port=8551
       - --authrpc.jwtsecret=/jwt.hex
+
+  # ============================================
+  # Validator 1 (seed=1)
+  # ============================================
+  validator-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: validator-1
+    volumes:
+      - ./config/validator-1:/config:ro
+      - ./keys/validator-1.key:/keys/validator.key:ro
+      - ./keys/celestia.key:/keys/celestia.key:ro
+      - validator-1-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=debug
+    ports:
+      - "26657:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      - reth-1
+    command: ["simplex", "--config", "/config/config.toml"]
+
+  reth-1:
+    image: ghcr.io/paradigmxyz/reth:v1.3.5
+    container_name: reth-1
+    volumes:
+      - reth-1-data:/data
+      - ./keys/jwt-1.hex:/jwt.hex:ro
+    networks:
+      - sequencer-net
+    command:
+      - node
+      - --datadir=/data
+      - --chain=dev
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+
+  # ============================================
+  # Validator 2 (seed=2)
+  # ============================================
+  validator-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: validator-2
+    volumes:
+      - ./config/validator-2:/config:ro
+      - ./keys/validator-2.key:/keys/validator.key:ro
+      - ./keys/celestia.key:/keys/celestia.key:ro
+      - validator-2-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=debug
+    ports:
+      - "26658:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      - reth-2
+    command: ["simplex", "--config", "/config/config.toml"]
+
+  reth-2:
+    image: ghcr.io/paradigmxyz/reth:v1.3.5
+    container_name: reth-2
+    volumes:
+      - reth-2-data:/data
+      - ./keys/jwt-2.hex:/jwt.hex:ro
+    networks:
+      - sequencer-net
+    command:
+      - node
+      - --datadir=/data
+      - --chain=dev
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+
+networks:
+  sequencer-net:
+    driver: bridge
+
+volumes:
+  validator-0-data:
+  validator-1-data:
+  validator-2-data:
+  reth-0-data:
+  reth-1-data:
+  reth-2-data:

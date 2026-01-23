@@ -1,5 +1,11 @@
 target/
 plans/
+
+# Docker keys (generated, sensitive)
+docker/keys/*.key
+docker/keys/*.hex
+!docker/keys/.gitkeep
+
 # dotenv
 .env
 

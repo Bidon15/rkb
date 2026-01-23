@@ -1,17 +1,23 @@
 # Build stage
-FROM rust:1.85-bookworm as builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /app
 COPY . .
 
-RUN cargo build --release
+RUN cargo build --release --bin sequencer
 
 # Runtime stage
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/sequencer /usr/local/bin/
 
+# Create directories for config and data
+RUN mkdir -p /config /data /keys
+
 ENTRYPOINT ["sequencer"]
-CMD ["run", "--config", "/config/config.toml"]
+CMD ["simplex", "--config", "/config/config.toml"]
