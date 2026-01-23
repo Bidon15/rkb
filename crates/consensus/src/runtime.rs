@@ -366,11 +366,11 @@ async fn run_simplex<E, C>(
         skip_timeout: ViewDelta::new(config.skip_timeout),
         fetch_timeout: config.fetch_timeout,
         fetch_concurrent: 4,
-        replay_buffer: NonZeroUsize::new(1024 * 1024).unwrap(),
-        write_buffer: NonZeroUsize::new(1024 * 1024).unwrap(),
+        replay_buffer: NonZeroUsize::new(1024 * 1024).expect("1MB is non-zero"),
+        write_buffer: NonZeroUsize::new(1024 * 1024).expect("1MB is non-zero"),
         buffer_pool: PoolRef::new(
-            NonZeroU16::new(PAGE_SIZE as u16).unwrap(),
-            NonZeroUsize::new(PAGE_CACHE_SIZE).unwrap(),
+            NonZeroU16::new(PAGE_SIZE as u16).expect("PAGE_SIZE is non-zero"),
+            NonZeroUsize::new(PAGE_CACHE_SIZE).expect("PAGE_CACHE_SIZE is non-zero"),
         ),
     };
 
@@ -383,7 +383,8 @@ async fn run_simplex<E, C>(
     );
 
     // Track current view for leader detection
-    let our_index = config.validator_index().unwrap();
+    // SAFETY: is_validator() was verified at the start of start_simplex_runtime()
+    let our_index = config.validator_index().expect("already verified we are a validator");
     let num_validators = config.validators.len();
 
     // Handle finalized blocks

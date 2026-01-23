@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.93"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/your-org/sequencer"
 
@@ -76,6 +76,10 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 hex = "0.4"
 sha3 = "0.10"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+ripemd = "0.1"
+bech32 = "0.11"
 
 # Metrics
 metrics = "0.24"
