@@ -200,34 +200,7 @@ impl ExecutionClient {
             "Applying built payload to reth"
         );
 
-        // Reconstruct ExecutionPayloadV3 from BuiltPayload using exact values from reth
-        let v1 = ExecutionPayloadV1 {
-            parent_hash: payload.parent_hash,
-            fee_recipient: payload.fee_recipient,
-            state_root: payload.state_root,
-            receipts_root: payload.receipts_root,
-            logs_bloom: alloy_primitives::Bloom::from_slice(&payload.logs_bloom),
-            prev_randao: payload.prev_randao,
-            block_number: payload.block_number,
-            gas_limit: payload.gas_limit,
-            gas_used: payload.gas_used,
-            timestamp: payload.timestamp,
-            extra_data: payload.extra_data.clone(),
-            base_fee_per_gas: U256::from(payload.base_fee_per_gas),
-            block_hash: payload.block_hash,
-            transactions: payload.transactions.clone(),
-        };
-
-        let v2 = ExecutionPayloadV2 {
-            payload_inner: v1,
-            withdrawals: vec![], // No withdrawals in PoA
-        };
-
-        let execution_payload = ExecutionPayloadV3 {
-            payload_inner: v2,
-            blob_gas_used: 0,
-            excess_blob_gas: 0,
-        };
+        let execution_payload = payload.to_execution_payload();
 
         // Call engine_newPayloadV3 to validate and import the block
         let response: PayloadStatus = self
@@ -435,34 +408,7 @@ impl BlockBuilder for ExecutionClient {
             "Importing payload to reth (newPayloadV3 only, no forkchoice update)"
         );
 
-        // Reconstruct ExecutionPayloadV3 from BuiltPayload
-        let v1 = ExecutionPayloadV1 {
-            parent_hash: payload.parent_hash,
-            fee_recipient: payload.fee_recipient,
-            state_root: payload.state_root,
-            receipts_root: payload.receipts_root,
-            logs_bloom: alloy_primitives::Bloom::from_slice(&payload.logs_bloom),
-            prev_randao: payload.prev_randao,
-            block_number: payload.block_number,
-            gas_limit: payload.gas_limit,
-            gas_used: payload.gas_used,
-            timestamp: payload.timestamp,
-            extra_data: payload.extra_data.clone(),
-            base_fee_per_gas: U256::from(payload.base_fee_per_gas),
-            block_hash: payload.block_hash,
-            transactions: payload.transactions.clone(),
-        };
-
-        let v2 = ExecutionPayloadV2 {
-            payload_inner: v1,
-            withdrawals: vec![],
-        };
-
-        let execution_payload = ExecutionPayloadV3 {
-            payload_inner: v2,
-            blob_gas_used: 0,
-            excess_blob_gas: 0,
-        };
+        let execution_payload = payload.to_execution_payload();
 
         // Call engine_newPayloadV3 to import (NOT finalize) the block
         let response: PayloadStatus = self

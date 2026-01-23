@@ -1,6 +1,7 @@
 //! Execution payload types.
 
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
 
 /// Payload ID returned by forkchoiceUpdated when building a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,42 @@ pub struct BuiltPayload {
 
     /// Base fee per gas.
     pub base_fee_per_gas: u64,
+}
+
+impl BuiltPayload {
+    /// Convert to Engine API ExecutionPayloadV3.
+    ///
+    /// This is used when submitting the payload to reth via `newPayloadV3`.
+    #[must_use]
+    pub fn to_execution_payload(&self) -> ExecutionPayloadV3 {
+        let v1 = ExecutionPayloadV1 {
+            parent_hash: self.parent_hash,
+            fee_recipient: self.fee_recipient,
+            state_root: self.state_root,
+            receipts_root: self.receipts_root,
+            logs_bloom: alloy_primitives::Bloom::from_slice(&self.logs_bloom),
+            prev_randao: self.prev_randao,
+            block_number: self.block_number,
+            gas_limit: self.gas_limit,
+            gas_used: self.gas_used,
+            timestamp: self.timestamp,
+            extra_data: self.extra_data.clone(),
+            base_fee_per_gas: U256::from(self.base_fee_per_gas),
+            block_hash: self.block_hash,
+            transactions: self.transactions.clone(),
+        };
+
+        let v2 = ExecutionPayloadV2 {
+            payload_inner: v1,
+            withdrawals: vec![], // No withdrawals in PoA
+        };
+
+        ExecutionPayloadV3 {
+            payload_inner: v2,
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
 }
 
 /// Result of executing a block.
