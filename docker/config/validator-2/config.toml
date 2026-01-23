@@ -56,7 +56,7 @@ celestia_key_path = "/keys/celestia.key"
 namespace = "617374726961"
 
 # Gas price
-gas_price = 0.002
+gas_price = 0.04
 
 # Batch submission interval (ms) - accumulate blocks and submit together
 # Set to 0 to submit every block immediately (not recommended)

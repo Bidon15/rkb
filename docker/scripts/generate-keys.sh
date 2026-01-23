@@ -86,6 +86,18 @@ openssl rand -hex 32 > "$KEYS_DIR/jwt-2.hex"
 echo "   Generated jwt-0.hex, jwt-1.hex, jwt-2.hex"
 
 echo ""
+echo "4. Generating reth P2P keys for transaction gossip..."
+echo "   (Used for devp2p networking between reth nodes)"
+echo ""
+
+# Generate reth p2p keys (secp256k1 private keys for devp2p)
+# These allow reth nodes to discover each other and gossip transactions
+openssl rand -hex 32 > "$KEYS_DIR/reth-p2p-0.key"
+openssl rand -hex 32 > "$KEYS_DIR/reth-p2p-1.key"
+openssl rand -hex 32 > "$KEYS_DIR/reth-p2p-2.key"
+echo "   Generated reth-p2p-0.key, reth-p2p-1.key, reth-p2p-2.key"
+
+echo ""
 echo "============================================"
 echo "All keys generated in $KEYS_DIR"
 echo "============================================"
