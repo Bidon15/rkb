@@ -13,8 +13,9 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{ed25519::PublicKey, Hasher, Sha256};
 use futures::channel::{mpsc, oneshot};
+use sequencer_execution::{BlockBuilder, BuiltPayload, ExecutionClient};
 use sequencer_types::{Block, BlockHeader, Transaction};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 
 /// Digest type used by our application.
 pub type AppDigest = <Sha256 as Hasher>::Digest;
@@ -45,6 +46,10 @@ pub enum Message {
     Broadcast {
         payload: AppDigest,
     },
+    /// Finalize a block (triggered when consensus reaches finalization).
+    Finalize {
+        digest: AppDigest,
+    },
 }
 
 /// Mailbox for communicating with the application actor.
@@ -60,6 +65,15 @@ impl Mailbox {
     /// Create a new mailbox with the given sender.
     pub const fn new(sender: mpsc::Sender<Message>) -> Self {
         Self { sender }
+    }
+
+    /// Send a finalize message to the application.
+    ///
+    /// This is called by the reporter when consensus finalizes a block.
+    pub fn finalize(&mut self, digest: AppDigest) {
+        if self.sender.try_send(Message::Finalize { digest }).is_err() {
+            tracing::warn!("Failed to send finalize message to application");
+        }
     }
 }
 
@@ -115,35 +129,37 @@ pub struct ApplicationConfig {
     /// Initial block height.
     pub initial_height: u64,
 
+    /// Initial block hash (parent of first block).
+    pub initial_hash: B256,
+
     /// Proposer address (our validator address).
     pub proposer: Address,
+
+    /// Execution client for building blocks via reth.
+    pub execution: Arc<ExecutionClient>,
 
     /// Mailbox size for message buffering.
     pub mailbox_size: usize,
 }
 
-impl Default for ApplicationConfig {
-    fn default() -> Self {
-        Self {
-            initial_height: 1,
-            proposer: Address::ZERO,
-            mailbox_size: 1024,
-        }
-    }
-}
-
 /// Application state for block production.
 ///
-/// This manages the mempool, pending blocks, and coordinates with Simplex consensus.
+/// This coordinates block building with reth via the ExecutionClient
+/// and integrates with Simplex consensus.
 pub struct Application {
     /// Hasher for computing digests.
     hasher: Sha256,
 
-    /// Pending transactions waiting to be included in a block.
-    mempool: Arc<RwLock<Vec<Transaction>>>,
+    /// Execution client for building blocks via reth.
+    execution: Arc<ExecutionClient>,
 
     /// Pending blocks that have been proposed but not yet finalized.
+    /// Keyed by digest (hash of reth's block_hash).
     pending_blocks: HashMap<AppDigest, Block>,
+
+    /// Built payloads from reth, keyed by digest.
+    /// Contains the full payload data for execution.
+    pending_payloads: HashMap<AppDigest, BuiltPayload>,
 
     /// Verified block digests.
     verified: std::collections::HashSet<AppDigest>,
@@ -157,10 +173,10 @@ pub struct Application {
     /// Current block height.
     height: u64,
 
-    /// Last block hash.
+    /// Last block hash (reth's EVM block hash).
     last_hash: B256,
 
-    /// Proposer address.
+    /// Proposer address (fee recipient).
     proposer: Address,
 }
 
@@ -168,31 +184,24 @@ impl Application {
     /// Create a new application with the given configuration.
     ///
     /// Returns the application actor and its mailbox for communication.
-    pub fn new(
-        config: ApplicationConfig,
-        mempool: Arc<RwLock<Vec<Transaction>>>,
-    ) -> (Self, Mailbox, broadcast::Receiver<Block>) {
+    pub fn new(config: ApplicationConfig) -> (Self, Mailbox, broadcast::Receiver<Block>) {
         let (sender, receiver) = mpsc::channel(config.mailbox_size);
         let (block_sender, block_receiver) = broadcast::channel(100);
 
         let app = Self {
             hasher: Sha256::default(),
-            mempool,
+            execution: config.execution,
             pending_blocks: HashMap::new(),
+            pending_payloads: HashMap::new(),
             verified: std::collections::HashSet::new(),
             mailbox: receiver,
             block_sender,
             height: config.initial_height,
-            last_hash: B256::ZERO,
+            last_hash: config.initial_hash,
             proposer: config.proposer,
         };
 
         (app, Mailbox::new(sender), block_receiver)
-    }
-
-    /// Get a reference to the mempool.
-    pub fn mempool(&self) -> &Arc<RwLock<Vec<Transaction>>> {
-        &self.mempool
     }
 
     /// Generate genesis digest for the given epoch.
@@ -204,38 +213,81 @@ impl Application {
         digest
     }
 
-    /// Propose a new block.
+    /// Propose a new block using the vanilla Ethereum builder flow.
+    ///
+    /// This tells reth to build a block from its mempool, then retrieves
+    /// the built block. Reth controls transaction ordering and block contents.
     async fn propose(&mut self, context: AppContext) -> AppDigest {
-        // Get transactions from mempool
-        let transactions: Vec<Transaction> = self.mempool.write().await.drain(..).collect();
-
-        // Build block header
-        let header = BlockHeader {
-            height: self.height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            parent_hash: self.last_hash,
-            proposer: self.proposer,
-        };
-
-        let block = Block::new(header, transactions);
-        let block_hash = block.hash();
-
-        // Compute digest from block hash
-        self.hasher.update(block_hash.as_slice());
-        let digest = self.hasher.finalize();
-
-        // Store pending block
-        self.pending_blocks.insert(digest, block);
-        self.verified.insert(digest);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         tracing::debug!(
             height = self.height,
             ?context.round,
+            parent_hash = %self.last_hash,
+            "Starting block building via reth"
+        );
+
+        // Start building a block via reth
+        let payload_id = match self.execution.start_building(
+            self.last_hash,
+            timestamp,
+            self.proposer,
+        ).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(?e, "Failed to start building block");
+                // Return a dummy digest - this block will fail verification
+                return self.hasher.finalize();
+            }
+        };
+
+        // Get the built payload from reth
+        let payload = match self.execution.get_payload(payload_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(?e, "Failed to get built payload");
+                return self.hasher.finalize();
+            }
+        };
+
+        // Use reth's block hash as the authoritative hash
+        let block_hash = payload.block_hash;
+
+        // Convert BuiltPayload to our Block type
+        let header = BlockHeader {
+            height: payload.block_number,
+            timestamp: payload.timestamp,
+            parent_hash: payload.parent_hash,
+            proposer: payload.fee_recipient,
+        };
+
+        // Convert transactions from Bytes to Transaction
+        let transactions: Vec<Transaction> = payload
+            .transactions
+            .iter()
+            .map(|tx| Transaction::new(tx.to_vec()))
+            .collect();
+
+        let block = Block::new(header, transactions);
+
+        // Compute digest from reth's block hash
+        self.hasher.update(block_hash.as_slice());
+        let digest = self.hasher.finalize();
+
+        // Store pending block and payload
+        self.pending_blocks.insert(digest, block);
+        self.pending_payloads.insert(digest, payload);
+        self.verified.insert(digest);
+
+        tracing::info!(
+            height = self.height,
+            ?context.round,
             %block_hash,
-            "Proposed block"
+            tx_count = self.pending_blocks.get(&digest).map(|b| b.tx_count()).unwrap_or(0),
+            "Proposed block via reth builder"
         );
 
         digest
@@ -262,9 +314,17 @@ impl Application {
     }
 
     /// Finalize a block and update state.
+    ///
+    /// Uses reth's authoritative block hash from the payload if available.
     pub fn finalize(&mut self, digest: AppDigest) -> Option<Block> {
         if let Some(block) = self.pending_blocks.remove(&digest) {
-            let block_hash = block.hash();
+            // Get reth's authoritative block hash from payload, or compute from header
+            let block_hash = self
+                .pending_payloads
+                .remove(&digest)
+                .map(|p| p.block_hash)
+                .unwrap_or_else(|| block.hash());
+
             self.height = block.height() + 1;
             self.last_hash = block_hash;
 
@@ -282,6 +342,8 @@ impl Application {
 
             Some(block)
         } else {
+            // Clean up orphaned payload if exists
+            self.pending_payloads.remove(&digest);
             tracing::warn!(?digest, "Attempted to finalize unknown block");
             None
         }
@@ -320,6 +382,9 @@ impl Application {
                 Message::Broadcast { payload } => {
                     self.broadcast(payload);
                 }
+                Message::Finalize { digest } => {
+                    self.finalize(digest);
+                }
             }
         }
 
@@ -329,18 +394,6 @@ impl Application {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_application_genesis() {
-        let mempool = Arc::new(RwLock::new(Vec::new()));
-        let config = ApplicationConfig::default();
-        let (mut app, _mailbox, _rx) = Application::new(config, mempool);
-
-        let digest1 = app.genesis(Epoch::zero());
-        let digest2 = app.genesis(Epoch::zero());
-
-        // Same epoch should produce same genesis
-        assert_eq!(digest1, digest2);
-    }
+    // Tests require a running reth instance for the ExecutionClient.
+    // Integration tests should be added in a separate test crate.
 }

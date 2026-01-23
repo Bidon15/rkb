@@ -7,6 +7,7 @@ description = "PoA consensus module using commonware-consensus"
 
 [dependencies]
 sequencer-types.workspace = true
+sequencer-execution.workspace = true
 
 # Commonware consensus
 commonware-codec = "0.0.65"

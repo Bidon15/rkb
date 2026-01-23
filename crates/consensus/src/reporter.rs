@@ -10,22 +10,25 @@ use commonware_consensus::{
     Reporter, Viewable,
 };
 
-use crate::application::AppDigest;
+use crate::application::{AppDigest, Mailbox};
 
-/// Reporter that logs consensus activity.
+/// Reporter that logs consensus activity and forwards finalization events.
 ///
-/// In a production system, this could emit metrics, track validator
-/// performance for rewards/slashing, or integrate with external monitoring.
+/// When a block is finalized by consensus, the reporter extracts the payload
+/// digest and sends a finalize message to the application actor, which then
+/// retrieves the block from pending storage and broadcasts it.
 #[derive(Clone)]
 pub struct ConsensusReporter {
     /// Whether to log activity at trace level.
     verbose: bool,
+    /// Mailbox to send finalization events to the application.
+    mailbox: Mailbox,
 }
 
 impl ConsensusReporter {
-    /// Create a new reporter.
-    pub const fn new(verbose: bool) -> Self {
-        Self { verbose }
+    /// Create a new reporter with a mailbox for forwarding finalization events.
+    pub fn new(verbose: bool, mailbox: Mailbox) -> Self {
+        Self { verbose, mailbox }
     }
 }
 
@@ -59,6 +62,9 @@ impl Reporter for ConsensusReporter {
             }
             Activity::Finalization(cert) => {
                 tracing::info!(view = ?cert.view(), "Block finalized by consensus");
+                // Forward finalization to application actor to retrieve and broadcast the block
+                let digest = cert.proposal.payload;
+                self.mailbox.finalize(digest);
             }
             Activity::ConflictingNotarize(evidence) => {
                 tracing::warn!(signer = ?evidence.signer(), "Conflicting notarize detected (equivocation)");

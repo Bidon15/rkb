@@ -26,7 +26,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
+use sequencer_execution::ExecutionClient;
 use commonware_consensus::{
     simplex::{
         config::Config as EngineConfig,
@@ -46,8 +47,7 @@ use commonware_runtime::{
 };
 use commonware_utils::{ordered::Set, union};
 use rand::{CryptoRng, RngCore};
-use sequencer_types::{Block, ConsensusConfig, Transaction};
-use tokio::sync::RwLock;
+use sequencer_types::{Block, ConsensusConfig};
 
 use crate::application::{Application, ApplicationConfig};
 use crate::network::{backlog, channels, rate_limits};
@@ -116,6 +116,10 @@ pub struct SimplexRuntimeConfig {
 
     /// Maximum message size.
     pub max_message_size: u32,
+
+    /// Initial block hash (parent of first block).
+    /// Use B256::ZERO for genesis.
+    pub initial_hash: B256,
 }
 
 impl SimplexRuntimeConfig {
@@ -129,6 +133,7 @@ impl SimplexRuntimeConfig {
         dialable_addr: SocketAddr,
         bootstrappers: Vec<(ed25519::PublicKey, SocketAddr)>,
         storage_dir: PathBuf,
+        initial_hash: B256,
     ) -> Self {
         Self {
             private_key,
@@ -149,6 +154,7 @@ impl SimplexRuntimeConfig {
             mailbox_size: 1024,
             allow_private_ips: true,
             max_message_size: 1024 * 1024,
+            initial_hash,
         }
     }
 
@@ -222,7 +228,7 @@ where
 /// This function blocks until the consensus engine shuts down.
 pub fn start_simplex_runtime<C: OnFinalized>(
     config: SimplexRuntimeConfig,
-    mempool: Arc<RwLock<Vec<Transaction>>>,
+    execution: Arc<ExecutionClient>,
     callback: C,
 ) -> Result<()> {
     if !config.is_validator() {
@@ -246,7 +252,7 @@ pub fn start_simplex_runtime<C: OnFinalized>(
     // Start the runtime
     let runner = Runner::new(runtime_config);
     runner.start(|context| async move {
-        run_simplex(context, config, mempool, callback).await
+        run_simplex(context, config, execution, callback).await
     });
 
     Ok(())
@@ -256,7 +262,7 @@ pub fn start_simplex_runtime<C: OnFinalized>(
 async fn run_simplex<E, C>(
     context: E,
     config: SimplexRuntimeConfig,
-    mempool: Arc<RwLock<Vec<Transaction>>>,
+    execution: Arc<ExecutionClient>,
     callback: C,
 ) where
     E: Spawner + Clock + CryptoRng + RngCore + RNetwork + Resolver + Metrics + Storage + Clone + Send + 'static,
@@ -325,14 +331,15 @@ async fn run_simplex<E, C>(
     // Start P2P network
     let network_handle = network.start();
 
-    // Create application
+    // Create application with execution client for vanilla Ethereum block building
     let app_config = ApplicationConfig {
         initial_height: 1,
+        initial_hash: config.initial_hash,
         proposer: config.our_address,
+        execution,
         mailbox_size: config.mailbox_size,
     };
-    let (application, app_mailbox, mut block_receiver) =
-        Application::new(app_config, Arc::clone(&mempool));
+    let (application, app_mailbox, mut block_receiver) = Application::new(app_config);
 
     // Spawn application actor
     let app_context = context.clone().with_label("application");
@@ -344,7 +351,8 @@ async fn run_simplex<E, C>(
     // Note: RoundRobin is an elector Config trait - Engine builds it internally
     let scheme = create_scheme(&config, &participants).expect("our key must be in validator set");
     let elector = RoundRobin::<Sha256>::default();
-    let reporter = ConsensusReporter::new(true);
+    // Reporter receives finalization events and forwards them to the application
+    let reporter = ConsensusReporter::new(true, app_mailbox.clone());
 
     // Create Simplex Engine config
     // Note: oracle implements Blocker trait, so we pass it directly
@@ -465,6 +473,7 @@ mod tests {
             mailbox_size: 1024,
             allow_private_ips: true,
             max_message_size: 1024 * 1024,
+            initial_hash: B256::ZERO,
         }
     }
 

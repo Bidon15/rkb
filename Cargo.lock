@@ -4663,6 +4663,9 @@ dependencies = [
  "hex",
  "rstest",
  "sequencer-types",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tendermint",
  "thiserror 2.0.18",
  "tokio",
@@ -4688,6 +4691,7 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rstest",
+ "sequencer-execution",
  "sequencer-types",
  "thiserror 2.0.18",
  "tokio",
@@ -4700,6 +4704,7 @@ name = "sequencer-execution"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
@@ -4708,6 +4713,7 @@ dependencies = [
  "jsonrpsee 0.24.10",
  "rstest",
  "sequencer-types",
+ "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",

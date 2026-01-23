@@ -39,6 +39,7 @@ alloy-primitives = { version = "0.8", features = ["serde", "rlp"] }
 alloy-rlp = { version = "0.3", features = ["derive"] }
 alloy-rpc-types-engine = "0.8"
 alloy-consensus = "0.8"
+alloy-eips = "0.8"
 
 # Celestia (Lumina client for direct gRPC submission)
 celestia-client = "0.4"

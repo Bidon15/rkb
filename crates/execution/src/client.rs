@@ -1,6 +1,6 @@
 //! Execution client implementation.
 
-use alloy_primitives::{Bytes, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 
 // =============================================================================
 // Constants
@@ -16,8 +16,10 @@ const DEFAULT_BASE_FEE_GWEI: u64 = 1_000_000_000;
 const HMAC_BLOCK_SIZE: usize = 64;
 
 use alloy_rpc_types_engine::{
-    ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
-    ForkchoiceState as EngineForkchoiceState, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
+    ExecutionPayloadEnvelopeV3, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
+    ForkchoiceState as EngineForkchoiceState, ForkchoiceUpdated,
+    PayloadAttributes as EnginePayloadAttributes, PayloadId as EnginePayloadId, PayloadStatus,
+    PayloadStatusEnum,
 };
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient, HttpClientBuilder};
@@ -27,7 +29,10 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::{Execution, ExecutionError, ExecutionResult, ExecutionStatus, ForkchoiceState, Result};
+use crate::{
+    BlockBuilder, BuiltPayload, Execution, ExecutionError, ExecutionResult, ExecutionStatus,
+    ForkchoiceState, PayloadId, Result,
+};
 
 /// Client for interacting with reth via Engine API.
 pub struct ExecutionClient {
@@ -77,6 +82,43 @@ impl ExecutionClient {
             client,
             forkchoice: Arc::new(RwLock::new(ForkchoiceState::default())),
         })
+    }
+
+    /// Get the genesis block hash from reth.
+    ///
+    /// This queries `eth_getBlockByNumber` for block 0 to get the actual
+    /// genesis hash. Must be called at startup to initialize forkchoice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn get_genesis_hash(&self) -> Result<B256> {
+        #[derive(serde::Deserialize)]
+        struct BlockResponse {
+            hash: B256,
+        }
+
+        let response: BlockResponse = self
+            .client
+            .request("eth_getBlockByNumber", rpc_params!["0x0", false])
+            .await
+            .map_err(|e| ExecutionError::ConnectionFailed(format!("failed to get genesis: {e}")))?;
+
+        tracing::info!(genesis_hash = %response.hash, "Retrieved genesis block hash from reth");
+        Ok(response.hash)
+    }
+
+    /// Initialize the forkchoice state with the genesis block hash.
+    ///
+    /// This should be called at startup before any consensus activity.
+    pub async fn init_forkchoice(&self, genesis_hash: B256) {
+        let state = ForkchoiceState {
+            head: genesis_hash,
+            safe: genesis_hash,
+            finalized: genesis_hash,
+        };
+        *self.forkchoice.write().await = state;
+        tracing::info!(%genesis_hash, "Forkchoice initialized with genesis");
     }
 
     /// Build execution payload from block.
@@ -217,6 +259,125 @@ impl Execution for ExecutionClient {
 
     async fn forkchoice(&self) -> Result<ForkchoiceState> {
         Ok(*self.forkchoice.read().await)
+    }
+}
+
+#[async_trait::async_trait]
+impl BlockBuilder for ExecutionClient {
+    async fn start_building(
+        &self,
+        parent_hash: B256,
+        timestamp: u64,
+        fee_recipient: Address,
+    ) -> Result<PayloadId> {
+        tracing::debug!(
+            %parent_hash,
+            timestamp,
+            %fee_recipient,
+            "Starting block building"
+        );
+
+        // Get current forkchoice
+        let current = *self.forkchoice.read().await;
+
+        let engine_state = EngineForkchoiceState {
+            head_block_hash: parent_hash,
+            safe_block_hash: current.safe,
+            finalized_block_hash: current.finalized,
+        };
+
+        // Build payload attributes for V3
+        let payload_attributes = EnginePayloadAttributes {
+            timestamp,
+            prev_randao: parent_hash, // Use parent hash as prev_randao for PoA
+            suggested_fee_recipient: fee_recipient,
+            withdrawals: Some(vec![]), // Empty withdrawals for PoA
+            parent_beacon_block_root: Some(B256::ZERO), // Required for V3
+            target_blobs_per_block: None,
+            max_blobs_per_block: None,
+        };
+
+        // Call forkchoiceUpdated with payload attributes to start building
+        let response: ForkchoiceUpdated = self
+            .client
+            .request(
+                "engine_forkchoiceUpdatedV3",
+                rpc_params![engine_state, Some(payload_attributes)],
+            )
+            .await
+            .map_err(|e| {
+                ExecutionError::ForkchoiceFailed(format!("forkchoiceUpdated RPC failed: {e}"))
+            })?;
+
+        tracing::debug!(
+            ?response.payload_status.status,
+            payload_id = ?response.payload_id,
+            "engine_forkchoiceUpdatedV3 response (with payload attributes)"
+        );
+
+        match response.payload_status.status {
+            PayloadStatusEnum::Valid | PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => {
+                // Extract payload ID
+                let payload_id = response.payload_id.ok_or_else(|| {
+                    ExecutionError::ForkchoiceFailed(
+                        "forkchoiceUpdated returned no payload ID".to_string(),
+                    )
+                })?;
+
+                tracing::info!(
+                    %parent_hash,
+                    ?payload_id,
+                    "Block building started"
+                );
+
+                // Convert from alloy PayloadId to our PayloadId
+                Ok(PayloadId::from_bytes(payload_id.0.into()))
+            }
+            PayloadStatusEnum::Invalid { ref validation_error } => {
+                Err(ExecutionError::ForkchoiceFailed(validation_error.clone()))
+            }
+        }
+    }
+
+    async fn get_payload(&self, payload_id: PayloadId) -> Result<BuiltPayload> {
+        tracing::debug!(?payload_id, "Getting built payload");
+
+        // Convert our PayloadId to alloy's
+        let engine_payload_id = EnginePayloadId::new(payload_id.0);
+
+        // Call getPayloadV3
+        let response: ExecutionPayloadEnvelopeV3 = self
+            .client
+            .request("engine_getPayloadV3", rpc_params![engine_payload_id])
+            .await
+            .map_err(|e| ExecutionError::ExecutionFailed(format!("getPayload RPC failed: {e}")))?;
+
+        let payload = response.execution_payload;
+        let v2 = payload.payload_inner;
+        let v1 = v2.payload_inner;
+
+        tracing::info!(
+            block_number = v1.block_number,
+            %v1.block_hash,
+            gas_used = v1.gas_used,
+            tx_count = v1.transactions.len(),
+            "Got built payload from reth"
+        );
+
+        Ok(BuiltPayload {
+            block_hash: v1.block_hash,
+            block_number: v1.block_number,
+            parent_hash: v1.parent_hash,
+            fee_recipient: v1.fee_recipient,
+            state_root: v1.state_root,
+            receipts_root: v1.receipts_root,
+            logs_bloom: v1.logs_bloom.0.to_vec().into(),
+            gas_limit: v1.gas_limit,
+            gas_used: v1.gas_used,
+            timestamp: v1.timestamp,
+            transactions: v1.transactions,
+            base_fee_per_gas: v1.base_fee_per_gas.to::<u64>(),
+        })
     }
 }
 

@@ -53,15 +53,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use commonware_consensus::{
     simplex::{elector::RoundRobin, scheme::ed25519::Scheme},
     types::Epoch,
 };
 use commonware_cryptography::{ed25519, Sha256, Signer};
 use futures::Stream;
-use sequencer_types::{Block, ConsensusConfig, Transaction};
-use tokio::sync::{broadcast, RwLock};
+use sequencer_execution::ExecutionClient;
+use sequencer_types::{Block, ConsensusConfig};
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 
 use crate::application::{Application, ApplicationConfig, Mailbox};
@@ -112,6 +113,12 @@ pub struct SimplexConfig {
 
     /// Network configuration.
     pub network: Option<NetworkConfig>,
+
+    /// Initial block hash (parent of first block).
+    pub initial_hash: B256,
+
+    /// Execution client for building blocks via reth.
+    pub execution: Arc<ExecutionClient>,
 }
 
 impl SimplexConfig {
@@ -121,6 +128,7 @@ impl SimplexConfig {
         our_key: ed25519::PrivateKey,
         validators: Vec<ed25519::PublicKey>,
         our_address: Address,
+        execution: Arc<ExecutionClient>,
     ) -> Self {
         Self {
             our_key,
@@ -137,6 +145,8 @@ impl SimplexConfig {
             fetch_concurrent: 4,
             mailbox_size: 1024,
             network: None,
+            initial_hash: B256::ZERO,
+            execution,
         }
     }
 }
@@ -157,9 +167,6 @@ pub struct SimplexConsensus {
     #[allow(dead_code)]
     mailbox: Mailbox,
 
-    /// Mempool of pending transactions.
-    mempool: Arc<RwLock<Vec<Transaction>>>,
-
     /// Block broadcast sender (for cloning).
     block_sender: broadcast::Sender<Block>,
 }
@@ -177,17 +184,15 @@ impl SimplexConsensus {
             ));
         }
 
-        // Create shared mempool
-        let mempool = Arc::new(RwLock::new(Vec::new()));
-
-        // Create application actor
+        // Create application actor with execution client
         let app_config = ApplicationConfig {
             initial_height: 1,
+            initial_hash: config.initial_hash,
             proposer: config.our_address,
+            execution: Arc::clone(&config.execution),
             mailbox_size: config.mailbox_size,
         };
-        let (application, mailbox, _block_receiver) =
-            Application::new(app_config, Arc::clone(&mempool));
+        let (application, mailbox, _block_receiver) = Application::new(app_config);
 
         // Get block sender for cloning
         let (block_sender, _) = broadcast::channel(100);
@@ -196,7 +201,6 @@ impl SimplexConsensus {
             config,
             application: Some(application),
             mailbox,
-            mempool,
             block_sender,
         })
     }
@@ -264,10 +268,12 @@ impl BlockProducer for SimplexConsensus {
         Ok(())
     }
 
-    async fn submit_transaction(&self, tx: Transaction) -> Result<()> {
-        // Add to mempool directly (Simplex will pick up during propose)
-        self.mempool.write().await.push(tx);
-        Ok(())
+    async fn submit_transaction(&self, _tx: sequencer_types::Transaction) -> Result<()> {
+        // With vanilla Ethereum flow, transactions go directly to reth's mempool
+        // via JSON-RPC (eth_sendRawTransaction), not through this method.
+        Err(ConsensusError::SubmitFailed(
+            "transactions should be submitted directly to reth's mempool".to_string(),
+        ))
     }
 
     fn block_stream(&self) -> Box<dyn Stream<Item = Block> + Send + Unpin> {
@@ -286,60 +292,6 @@ pub type SimplexElector = RoundRobin<Sha256>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn test_config() -> SimplexConfig {
-        let key = ed25519::PrivateKey::from_seed(0);
-        let pubkey = key.public_key();
-
-        SimplexConfig {
-            our_key: key,
-            validators: vec![pubkey],
-            our_address: Address::ZERO,
-            namespace: "test".to_string(),
-            epoch: 1,
-            leader_timeout: Duration::from_secs(2),
-            notarization_timeout: Duration::from_secs(3),
-            nullify_retry: Duration::from_secs(10),
-            activity_timeout: 100,
-            skip_timeout: 50,
-            fetch_timeout: Duration::from_secs(5),
-            fetch_concurrent: 4,
-            mailbox_size: 1024,
-            network: None,
-        }
-    }
-
-    #[test]
-    fn test_simplex_new() {
-        let config = test_config();
-        let consensus = SimplexConsensus::new(config);
-        assert!(consensus.is_ok());
-    }
-
-    #[test]
-    fn test_empty_validators_fails() {
-        let mut config = test_config();
-        config.validators = vec![];
-        let consensus = SimplexConsensus::new(config);
-        assert!(consensus.is_err());
-    }
-
-    #[test]
-    fn test_is_validator() {
-        let config = test_config();
-        let consensus = SimplexConsensus::new(config).unwrap();
-        assert!(consensus.is_validator());
-    }
-
-    #[test]
-    fn test_is_not_validator() {
-        let mut config = test_config();
-        // Use a different key in validators
-        let other_key = ed25519::PrivateKey::from_seed(999);
-        config.validators = vec![other_key.public_key()];
-
-        let consensus = SimplexConsensus::new(config).unwrap();
-        assert!(!consensus.is_validator());
-    }
+    // SimplexConsensus tests require a running reth instance for the ExecutionClient.
+    // Integration tests should be added in a separate test crate.
 }

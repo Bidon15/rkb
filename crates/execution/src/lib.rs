@@ -12,8 +12,9 @@ mod payload;
 pub use client::ExecutionClient;
 pub use error::ExecutionError;
 pub use forkchoice::ForkchoiceState;
-pub use payload::{ExecutionResult, ExecutionStatus};
+pub use payload::{BuiltPayload, ExecutionResult, ExecutionStatus, PayloadAttributes, PayloadId};
 
+use alloy_primitives::{Address, B256};
 use sequencer_types::Block;
 
 /// Result type for execution operations.
@@ -42,4 +43,53 @@ pub trait Execution: Send + Sync {
     ///
     /// Returns an error if the state cannot be retrieved.
     async fn forkchoice(&self) -> Result<ForkchoiceState>;
+}
+
+/// Trait for block building operations (vanilla Ethereum flow).
+///
+/// This trait provides the builder pattern where reth builds blocks
+/// from its mempool, rather than the sequencer specifying transactions.
+#[async_trait::async_trait]
+pub trait BlockBuilder: Send + Sync {
+    /// Start building a new block.
+    ///
+    /// Calls `forkchoiceUpdated` with payload attributes to signal reth
+    /// to start building a block from its mempool.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_hash` - Hash of the parent block
+    /// * `timestamp` - Timestamp for the new block
+    /// * `fee_recipient` - Address to receive transaction fees
+    ///
+    /// # Returns
+    ///
+    /// A payload ID that can be used to retrieve the built block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the build request fails.
+    async fn start_building(
+        &self,
+        parent_hash: B256,
+        timestamp: u64,
+        fee_recipient: Address,
+    ) -> Result<PayloadId>;
+
+    /// Get a built block.
+    ///
+    /// Calls `getPayload` to retrieve a block that reth has built.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload_id` - The ID returned by `start_building`
+    ///
+    /// # Returns
+    ///
+    /// The built payload with the correct block hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be retrieved.
+    async fn get_payload(&self, payload_id: PayloadId) -> Result<BuiltPayload>;
 }
