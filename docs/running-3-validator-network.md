@@ -106,7 +106,7 @@ Time 0ms:     Leader proposes block
 Time ~100ms:  2/3 validators vote → block notarized (soft finality)
 Time ~200ms:  Block executed on reth, forkchoice updated
 Time 5000ms:  Batch of ~25-50 blocks submitted to Celestia
-Time ~12s:    Celestia includes blob → firm finality
+Time ~6s:     Celestia includes blob → firm finality
 ```
 
 ### Verify Consensus is Working
@@ -240,7 +240,7 @@ peers = [
 | Level | Trigger | Latency | Guarantees |
 |-------|---------|---------|------------|
 | Soft | 2/3 notarization | ~100-200ms | BFT consensus agreement |
-| Firm | Celestia inclusion | ~6-12s | Data availability proven |
+| Firm | Celestia inclusion | ~6s | Data availability proven |
 
 ### Fault Tolerance
 
