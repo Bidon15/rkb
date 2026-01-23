@@ -326,16 +326,19 @@ impl Application {
         const MAX_SYNC_ATTEMPTS: u32 = 10;
         const SYNC_DELAY_MS: u64 = 100;
 
+        let mut parent_timestamp: u64 = 0;
+
         for sync_attempt in 1..=MAX_SYNC_ATTEMPTS {
-            // Query reth's actual head
-            let (reth_head_hash, reth_head_number) = match self.execution.get_head().await {
-                Ok(head) => head,
-                Err(e) => {
-                    tracing::warn!(?e, "Failed to query reth head, retrying...");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(SYNC_DELAY_MS)).await;
-                    continue;
-                }
-            };
+            // Query reth's actual head (hash, number, timestamp)
+            let (reth_head_hash, reth_head_number, reth_head_timestamp) =
+                match self.execution.get_head().await {
+                    Ok(head) => head,
+                    Err(e) => {
+                        tracing::warn!(?e, "Failed to query reth head, retrying...");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(SYNC_DELAY_MS)).await;
+                        continue;
+                    }
+                };
 
             // Our expected parent should match reth's head
             // We want to build block at height H, so reth should have block H-1 as head
@@ -343,9 +346,11 @@ impl Application {
 
             if reth_head_hash == self.last_hash {
                 // Perfect sync: reth's head matches our expected parent
+                parent_timestamp = reth_head_timestamp;
                 tracing::debug!(
                     reth_head = %reth_head_hash,
                     reth_height = reth_head_number,
+                    parent_timestamp,
                     our_parent = %self.last_hash,
                     "State synchronized, proceeding with block building"
                 );
@@ -385,12 +390,24 @@ impl Application {
             }
         }
 
-        // Now build with fresh timestamp
-        // CRITICAL: Compute fresh timestamp - Ethereum requires block.timestamp > parent.timestamp
-        let timestamp = std::time::SystemTime::now()
+        // Compute timestamp that's strictly greater than parent's
+        // CRITICAL: Ethereum requires block.timestamp > parent.timestamp
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
+        // Ensure timestamp is at least parent_timestamp + 1
+        let timestamp = now.max(parent_timestamp + 1);
+
+        if timestamp != now {
+            tracing::warn!(
+                now,
+                parent_timestamp,
+                adjusted_timestamp = timestamp,
+                "Adjusted block timestamp to be > parent (clock may be behind)"
+            );
+        }
 
         match self.execution.start_building(self.last_hash, timestamp, self.proposer).await {
             Ok(payload_id) => {
