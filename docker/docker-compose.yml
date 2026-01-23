@@ -23,7 +23,7 @@ services:
     volumes:
       - ./config/validator-0:/config:ro
       - ./keys/validator-0.key:/keys/validator.key:ro
-      - ./keys/celestia.key:/keys/celestia.key:ro
+      - ./keys/celestia-0.key:/keys/celestia.key:ro
       - validator-0-data:/data
     environment:
       - RUST_LOG=info,sequencer=debug
@@ -65,7 +65,7 @@ services:
     volumes:
       - ./config/validator-1:/config:ro
       - ./keys/validator-1.key:/keys/validator.key:ro
-      - ./keys/celestia.key:/keys/celestia.key:ro
+      - ./keys/celestia-1.key:/keys/celestia.key:ro
       - validator-1-data:/data
     environment:
       - RUST_LOG=info,sequencer=debug
@@ -107,7 +107,7 @@ services:
     volumes:
       - ./config/validator-2:/config:ro
       - ./keys/validator-2.key:/keys/validator.key:ro
-      - ./keys/celestia.key:/keys/celestia.key:ro
+      - ./keys/celestia-2.key:/keys/celestia.key:ro
       - validator-2-data:/data
     environment:
       - RUST_LOG=info,sequencer=debug

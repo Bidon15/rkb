@@ -45,17 +45,32 @@ cd docker
 ```
 
 This creates:
-- `keys/validator-0.key`, `validator-1.key`, `validator-2.key` - Ed25519 validator keys
-- `keys/jwt-0.hex`, `jwt-1.hex`, `jwt-2.hex` - JWT secrets for reth
-- `keys/celestia.key` - Celestia signing key (needs funding!)
 
-### 2. Fund Celestia Account (Required)
+| Key Type | Files | Purpose |
+|----------|-------|---------|
+| Ed25519 Validator | `validator-{0,1,2}.key` | Consensus message signing |
+| secp256k1 Celestia | `celestia-{0,1,2}.key` | Blob submission (PayForBlobs) |
+| JWT Secrets | `jwt-{0,1,2}.hex` | reth Engine API auth |
 
-For blob submission to work, you need to fund the Celestia account:
+### 2. Fund ALL THREE Celestia Accounts (Required)
 
-1. Get the address from your celestia.key (secp256k1)
+Each validator needs its own funded Celestia account because any validator can become the leader and submit blobs.
+
+**You must fund 3 separate addresses:**
+
+```
+celestia-0.key → Address for Validator 0
+celestia-1.key → Address for Validator 1
+celestia-2.key → Address for Validator 2
+```
+
+Steps:
+1. Get the address from each `celestia-*.key` (secp256k1 private key)
 2. Visit the Mocha faucet: https://faucet.celestia-mocha.com/
-3. Request testnet TIA tokens
+3. Request testnet TIA tokens for **each** address
+4. Verify all 3 accounts have sufficient balance before starting
+
+**Why 3 keys?** The leader rotates each block. When Validator 1 is leader, it uses `celestia-1.key` to submit. Without funding, that validator's blob submissions will fail.
 
 ### 3. Start the Network
 
