@@ -109,32 +109,75 @@ fn default_namespace() -> String {
 
 /// Celestia DA configuration.
 ///
-/// Uses celestia-client (Lumina) for direct gRPC blob submission,
-/// which doesn't require a bridge node auth token.
+/// Supports separate endpoints for reading (bridge node) and submitting (core gRPC).
+/// Uses celestia-client (Lumina) for blob operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CelestiaConfig {
-    /// RPC endpoint for Celestia node (e.g., "http://localhost:26657").
-    /// Used for header subscription and queries.
-    pub rpc_endpoint: String,
+    /// Bridge node address for reading blobs (e.g., "https://node.example.com/").
+    /// This is the DA node RPC endpoint.
+    #[serde(alias = "rpc_endpoint")]
+    pub bridge_addr: String,
 
-    /// gRPC endpoint for Celestia node (e.g., "http://localhost:9090").
-    /// Used for blob submission via PayForBlobs transaction.
-    pub grpc_endpoint: String,
+    /// Auth token for bridge node (empty string if not required).
+    #[serde(default)]
+    pub bridge_auth_token: String,
+
+    /// Enable TLS for bridge connection.
+    #[serde(default)]
+    pub bridge_tls_enabled: bool,
+
+    /// Core gRPC address for submitting blobs (e.g., "node.example.com:9090").
+    /// This is the consensus node gRPC endpoint for PayForBlobs transactions.
+    #[serde(alias = "grpc_endpoint")]
+    pub core_grpc_addr: String,
+
+    /// Auth token for core gRPC (used as metadata header).
+    #[serde(default)]
+    pub core_grpc_auth_token: String,
+
+    /// Enable TLS for core gRPC connection.
+    #[serde(default)]
+    pub core_grpc_tls_enabled: bool,
 
     /// Path to Celestia account private key (hex-encoded secp256k1).
     /// This key is used to sign PayForBlobs transactions.
     pub celestia_key_path: PathBuf,
 
-    /// Namespace for this chain's blobs (hex-encoded).
+    /// Namespace for this chain's blobs (hex-encoded, max 10 bytes).
+    /// Will be auto-padded to Celestia's v0 namespace format.
     pub namespace: String,
 
     /// Gas price for submissions (in utia).
     #[serde(default = "default_gas_price")]
     pub gas_price: f64,
+
+    /// Batch submission interval in milliseconds.
+    ///
+    /// Blocks are accumulated and submitted as a batch at this interval.
+    /// Set to 0 to submit every block immediately (not recommended).
+    /// Default: 5000ms (5 seconds, slightly less than Celestia's 6s block time).
+    #[serde(default = "default_batch_interval_ms")]
+    pub batch_interval_ms: u64,
+
+    /// Maximum batch size in bytes before triggering early submission.
+    ///
+    /// If the accumulated batch exceeds this size, it will be submitted
+    /// immediately rather than waiting for the batch interval.
+    /// Default: 1.5MB (well under Celestia's ~2MB blob limit).
+    #[serde(default = "default_max_batch_size_bytes")]
+    pub max_batch_size_bytes: usize,
 }
 
 fn default_gas_price() -> f64 {
     0.002
+}
+
+fn default_batch_interval_ms() -> u64 {
+    5000 // 5 seconds - just under Celestia's 6s block time
+}
+
+fn default_max_batch_size_bytes() -> usize {
+    1_500_000 // 1.5MB - well under Celestia's ~2MB limit
 }
 
 /// Execution layer configuration.

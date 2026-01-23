@@ -55,15 +55,15 @@ impl CelestiaClient {
         config: CelestiaConfig,
         finality_tx: mpsc::Sender<FinalityConfirmation>,
     ) -> Result<Self> {
-        if config.rpc_endpoint.is_empty() {
+        if config.bridge_addr.is_empty() {
             return Err(CelestiaError::InvalidConfig(
-                "rpc_endpoint cannot be empty".to_string(),
+                "bridge_addr cannot be empty".to_string(),
             ));
         }
 
-        if config.grpc_endpoint.is_empty() {
+        if config.core_grpc_addr.is_empty() {
             return Err(CelestiaError::InvalidConfig(
-                "grpc_endpoint cannot be empty".to_string(),
+                "core_grpc_addr cannot be empty".to_string(),
             ));
         }
 
@@ -89,11 +89,26 @@ impl CelestiaClient {
             )));
         };
 
-        // Create Lumina client for blob submission (gRPC)
-        let lumina_client = ClientBuilder::new()
-            .rpc_url(&config.rpc_endpoint)
-            .grpc_url(&config.grpc_endpoint)
-            .private_key_hex(&private_key_hex)
+        // Build gRPC URL with proper scheme based on TLS setting
+        let grpc_url = Self::build_grpc_url(&config.core_grpc_addr, config.core_grpc_tls_enabled);
+
+        // Create Lumina client builder
+        let mut builder = ClientBuilder::new()
+            .rpc_url(&config.bridge_addr)
+            .grpc_url(&grpc_url)
+            .private_key_hex(&private_key_hex);
+
+        // Add bridge auth token if provided
+        if !config.bridge_auth_token.is_empty() {
+            builder = builder.rpc_auth_token(&config.bridge_auth_token);
+        }
+
+        // Add gRPC auth token as metadata if provided
+        if !config.core_grpc_auth_token.is_empty() {
+            builder = builder.grpc_metadata("authorization", &config.core_grpc_auth_token);
+        }
+
+        let lumina_client = builder
             .build()
             .await
             .map_err(|e| CelestiaError::ConnectionFailed(format!("lumina client: {e}")))?;
@@ -104,15 +119,19 @@ impl CelestiaClient {
             .unwrap_or_else(|_| "unknown".to_string());
 
         tracing::info!(
-            rpc_endpoint = %config.rpc_endpoint,
-            grpc_endpoint = %config.grpc_endpoint,
+            bridge_addr = %config.bridge_addr,
+            core_grpc_addr = %grpc_url,
             address = %address_str,
             "Lumina client initialized for blob submission"
         );
 
         // Create RPC client for header subscription (finality tracking)
-        // Note: This client doesn't need auth token for read-only operations
-        let rpc_client = RpcClient::new(&config.rpc_endpoint, None, None, None)
+        let rpc_auth = if config.bridge_auth_token.is_empty() {
+            None
+        } else {
+            Some(config.bridge_auth_token.as_str())
+        };
+        let rpc_client = RpcClient::new(&config.bridge_addr, rpc_auth, None, None)
             .await
             .map_err(|e| CelestiaError::ConnectionFailed(format!("rpc client: {e}")))?;
 
@@ -120,8 +139,8 @@ impl CelestiaClient {
         let (finality_broadcast, _) = broadcast::channel(100);
 
         tracing::info!(
-            rpc_endpoint = %config.rpc_endpoint,
-            grpc_endpoint = %config.grpc_endpoint,
+            bridge_addr = %config.bridge_addr,
+            core_grpc_addr = %grpc_url,
             namespace = %config.namespace,
             "Connected to Celestia node"
         );
@@ -135,6 +154,21 @@ impl CelestiaClient {
             finality_tx,
             finality_broadcast,
         })
+    }
+
+    /// Build gRPC URL with proper scheme based on TLS setting.
+    fn build_grpc_url(addr: &str, tls_enabled: bool) -> String {
+        // If address already has a scheme, use it as-is
+        if addr.starts_with("http://") || addr.starts_with("https://") {
+            return addr.to_string();
+        }
+
+        // Otherwise, add the appropriate scheme
+        if tls_enabled {
+            format!("https://{addr}")
+        } else {
+            format!("http://{addr}")
+        }
     }
 
     /// Encode a block as blob data.
@@ -164,11 +198,11 @@ impl CelestiaClient {
             // Configure transaction with gas price from config
             let tx_config = TxConfig::default().with_gas_price(self.config.gas_price);
 
-            match self.lumina_client.blob().submit(&[blob.clone()], tx_config).await {
+            match self.lumina_client.blob().submit(std::slice::from_ref(&blob), tx_config).await {
                 Ok(tx_info) => {
                     tracing::debug!(
                         height = tx_info.height,
-                        tx_hash = %hex::encode(&tx_info.hash),
+                        tx_hash = %hex::encode(tx_info.hash),
                         "Blob submitted via gRPC"
                     );
                     return Ok((tx_info.height, commitment));
@@ -234,10 +268,11 @@ impl CelestiaClient {
                     let celestia_hash = header.hash();
 
                     // Convert Celestia hash to B256
+                    // Celestia hashes are always 32 bytes (SHA256), so this should never fail
                     let hash_bytes: [u8; 32] = celestia_hash
                         .as_bytes()
                         .try_into()
-                        .unwrap_or([0u8; 32]);
+                        .expect("Celestia header hash is always 32 bytes");
                     let header_hash = B256::from(hash_bytes);
 
                     tracing::debug!(
@@ -321,29 +356,27 @@ impl CelestiaClient {
             return Ok(vec![]);
         };
 
-        let mut blocks = Vec::with_capacity(blob_list.len());
-
-        for blob in &blob_list {
-            match Self::decode_block(&blob.data) {
-                Ok(block) => {
-                    tracing::debug!(
-                        celestia_height,
-                        block_height = block.height(),
-                        "Retrieved block from Celestia"
-                    );
-                    blocks.push(block);
-                }
-                Err(e) => {
-                    // Skip blobs that don't decode as valid blocks
-                    // (could be from different applications using same namespace)
-                    tracing::trace!(
-                        celestia_height,
-                        error = %e,
-                        "Skipping blob that failed to decode"
-                    );
-                }
-            }
-        }
+        let blocks: Vec<_> = blob_list
+            .iter()
+            .filter_map(|blob| {
+                Self::decode_block(&blob.data)
+                    .inspect(|block| {
+                        tracing::debug!(
+                            celestia_height,
+                            block_height = block.height(),
+                            "Retrieved block from Celestia"
+                        );
+                    })
+                    .inspect_err(|e| {
+                        tracing::trace!(
+                            celestia_height,
+                            error = %e,
+                            "Skipping blob that failed to decode"
+                        );
+                    })
+                    .ok()
+            })
+            .collect();
 
         Ok(blocks)
     }
@@ -430,20 +463,17 @@ impl CelestiaClient {
             return Ok(false);
         };
 
-        // Check if any blob matches the commitment
-        for blob in &blob_list {
-            let blob_commitment = Self::commitment_to_bytes(blob.commitment.into());
-            if blob_commitment == commitment {
-                tracing::debug!(celestia_height, "Blob inclusion verified");
-                return Ok(true);
-            }
+        let found = blob_list
+            .iter()
+            .any(|blob| Self::commitment_to_bytes(blob.commitment.into()) == commitment);
+
+        if found {
+            tracing::debug!(celestia_height, "Blob inclusion verified");
+        } else {
+            tracing::debug!(celestia_height, "Blob not found with matching commitment");
         }
 
-        tracing::debug!(
-            celestia_height,
-            "Blob not found with matching commitment"
-        );
-        Ok(false)
+        Ok(found)
     }
 
     /// Get the Celestia address for this client.
@@ -472,6 +502,103 @@ impl CelestiaClient {
     /// Get the last known finalized Celestia height.
     pub async fn finalized_height(&self) -> u64 {
         self.finality_tracker.read().await.finalized_height()
+    }
+}
+
+impl CelestiaClient {
+    /// Submit multiple blocks as a batch to Celestia.
+    ///
+    /// This creates one blob per block and submits them all in a single
+    /// PayForBlobs transaction, which is more efficient than submitting
+    /// blocks individually.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if submission fails.
+    pub async fn submit_blocks(&self, blocks: &[Block]) -> Result<Vec<BlobSubmission>> {
+        if blocks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        tracing::info!(
+            block_count = blocks.len(),
+            first_height = blocks.first().map(Block::height),
+            last_height = blocks.last().map(Block::height),
+            "Submitting block batch to Celestia"
+        );
+
+        // Get our address for blob creation
+        let address = self.lumina_client.address().map_err(|e| {
+            CelestiaError::Internal(format!("failed to get address: {e}"))
+        })?;
+
+        // Create blobs for all blocks
+        let mut blobs = Vec::with_capacity(blocks.len());
+        let mut block_infos: Vec<(B256, u64)> = Vec::with_capacity(blocks.len());
+
+        for block in blocks {
+            let blob_data = Self::encode_block(block)?;
+            let blob =
+                Blob::new(self.namespace, blob_data, Some(address), AppVersion::latest())
+                    .map_err(|e| CelestiaError::EncodeFailed(format!("failed to create blob: {e}")))?;
+            blobs.push(blob);
+            block_infos.push((block.hash(), block.height()));
+        }
+
+        // Submit all blobs in one transaction
+        let tx_config = TxConfig::default().with_gas_price(self.config.gas_price);
+
+        let mut attempts = 0;
+        let max_retries = DEFAULT_MAX_RETRIES;
+
+        let celestia_height = loop {
+            attempts += 1;
+
+            match self.lumina_client.blob().submit(&blobs, tx_config.clone()).await {
+                Ok(tx_info) => {
+                    tracing::info!(
+                        height = tx_info.height,
+                        tx_hash = %hex::encode(tx_info.hash),
+                        block_count = blobs.len(),
+                        "Block batch submitted to Celestia"
+                    );
+                    break tx_info.height;
+                }
+                Err(e) => {
+                    if attempts >= max_retries {
+                        return Err(CelestiaError::SubmissionFailed(format!(
+                            "batch submission failed after {attempts} attempts: {e}"
+                        )));
+                    }
+
+                    tracing::warn!(
+                        attempt = attempts,
+                        max_retries,
+                        error = %e,
+                        "Batch submission failed, retrying..."
+                    );
+
+                    tokio::time::sleep(Duration::from_millis(
+                        DEFAULT_RETRY_DELAY_MS * u64::from(attempts),
+                    ))
+                    .await;
+                }
+            }
+        };
+
+        // Build submission results
+        let submissions: Vec<BlobSubmission> = block_infos
+            .into_iter()
+            .zip(blobs.iter())
+            .map(|((block_hash, block_height), blob)| BlobSubmission {
+                block_hash,
+                block_height,
+                celestia_height,
+                commitment: Self::commitment_to_bytes(blob.commitment.into()),
+            })
+            .collect();
+
+        Ok(submissions)
     }
 }
 
@@ -523,7 +650,7 @@ impl DataAvailability for CelestiaClient {
         // Subscribe to the broadcast channel
         let rx = self.finality_broadcast.subscribe();
         Box::new(
-            tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| r.ok()),
+            tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(std::result::Result::ok),
         )
     }
 
