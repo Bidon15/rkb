@@ -171,19 +171,19 @@ impl ExecutionClient {
             "Applying built payload to reth"
         );
 
-        // Reconstruct ExecutionPayloadV3 from BuiltPayload
+        // Reconstruct ExecutionPayloadV3 from BuiltPayload using exact values from reth
         let v1 = ExecutionPayloadV1 {
             parent_hash: payload.parent_hash,
             fee_recipient: payload.fee_recipient,
             state_root: payload.state_root,
             receipts_root: payload.receipts_root,
             logs_bloom: alloy_primitives::Bloom::from_slice(&payload.logs_bloom),
-            prev_randao: payload.parent_hash, // Use parent hash as prev_randao for PoA
+            prev_randao: payload.prev_randao,
             block_number: payload.block_number,
             gas_limit: payload.gas_limit,
             gas_used: payload.gas_used,
             timestamp: payload.timestamp,
-            extra_data: Bytes::new(),
+            extra_data: payload.extra_data.clone(),
             base_fee_per_gas: U256::from(payload.base_fee_per_gas),
             block_hash: payload.block_hash,
             transactions: payload.transactions.clone(),
@@ -517,6 +517,8 @@ impl BlockBuilder for ExecutionClient {
             state_root: v1.state_root,
             receipts_root: v1.receipts_root,
             logs_bloom: v1.logs_bloom.0.to_vec().into(),
+            prev_randao: v1.prev_randao,
+            extra_data: v1.extra_data.clone(),
             gas_limit: v1.gas_limit,
             gas_used: v1.gas_used,
             timestamp: v1.timestamp,

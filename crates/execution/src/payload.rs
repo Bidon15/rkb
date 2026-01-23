@@ -57,6 +57,12 @@ pub struct BuiltPayload {
     /// Logs bloom.
     pub logs_bloom: Bytes,
 
+    /// Previous RANDAO value (required for block hash computation).
+    pub prev_randao: B256,
+
+    /// Extra data (required for block hash computation).
+    pub extra_data: Bytes,
+
     /// Gas limit.
     pub gas_limit: u64,
 
