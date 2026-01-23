@@ -62,7 +62,10 @@ impl SimplexSequencer {
             .get_genesis_hash()
             .await
             .wrap_err("failed to get genesis hash from reth")?;
-        execution.init_forkchoice(genesis_hash).await;
+        execution
+            .init_forkchoice(genesis_hash)
+            .await
+            .wrap_err("failed to initialize forkchoice on reth")?;
 
         let forkchoice = Arc::new(RwLock::new(ForkchoiceState {
             head: genesis_hash,

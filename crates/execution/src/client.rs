@@ -110,15 +110,24 @@ impl ExecutionClient {
 
     /// Initialize the forkchoice state with the genesis block hash.
     ///
-    /// This should be called at startup before any consensus activity.
-    pub async fn init_forkchoice(&self, genesis_hash: B256) {
+    /// This calls `forkchoiceUpdated` on reth to establish the initial forkchoice,
+    /// which is required before block building can start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forkchoice update fails.
+    pub async fn init_forkchoice(&self, genesis_hash: B256) -> Result<()> {
         let state = ForkchoiceState {
             head: genesis_hash,
             safe: genesis_hash,
             finalized: genesis_hash,
         };
-        *self.forkchoice.write().await = state;
-        tracing::info!(%genesis_hash, "Forkchoice initialized with genesis");
+
+        // Call forkchoiceUpdated on reth to establish initial state
+        self.update_forkchoice(state).await?;
+
+        tracing::info!(%genesis_hash, "Forkchoice initialized with genesis on reth");
+        Ok(())
     }
 
     /// Build execution payload from block.
