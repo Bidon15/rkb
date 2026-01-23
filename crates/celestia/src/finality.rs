@@ -39,24 +39,19 @@ impl FinalityConfirmation {
 
 /// Pending finality entry.
 #[derive(Debug, Clone)]
-pub struct PendingFinality {
-    /// Our block hash.
-    pub block_hash: B256,
-
+struct PendingFinality {
     /// Our block height.
-    pub block_height: u64,
+    block_height: u64,
 
     /// Celestia height where blob was submitted.
-    pub celestia_height: u64,
-
-    /// Blob commitment.
-    pub commitment: Vec<u8>,
+    celestia_height: u64,
 
     /// When submitted.
-    pub submitted_at: Instant,
+    submitted_at: Instant,
 }
 
 /// Tracks blocks awaiting Celestia finality.
+#[derive(Default)]
 pub struct FinalityTracker {
     /// Blocks awaiting finality, keyed by block hash.
     pending: HashMap<B256, PendingFinality>,
@@ -69,16 +64,14 @@ impl FinalityTracker {
     /// Create a new finality tracker.
     #[must_use]
     pub fn new() -> Self {
-        Self { pending: HashMap::new(), celestia_finalized_height: 0 }
+        Self::default()
     }
 
     /// Track a new submission for finality.
     pub fn track(&mut self, submission: BlobSubmission) {
         let pending = PendingFinality {
-            block_hash: submission.block_hash,
             block_height: submission.block_height,
             celestia_height: submission.celestia_height,
-            commitment: submission.commitment,
             submitted_at: Instant::now(),
         };
 
@@ -133,12 +126,6 @@ impl FinalityTracker {
     #[must_use]
     pub fn finalized_height(&self) -> u64 {
         self.celestia_finalized_height
-    }
-}
-
-impl Default for FinalityTracker {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

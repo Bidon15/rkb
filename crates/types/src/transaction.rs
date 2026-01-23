@@ -9,7 +9,7 @@ pub type TransactionHash = B256;
 /// A transaction to be included in a block.
 ///
 /// Transactions are opaque bytes - the execution layer (reth) interprets them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     /// Raw transaction bytes (RLP-encoded Ethereum transaction).
     data: Vec<u8>,
@@ -46,9 +46,10 @@ impl Transaction {
         self.data.is_empty()
     }
 
-    /// Compute the transaction hash.
+    /// Compute the transaction hash (keccak256).
     ///
-    /// Hash is keccak256 of raw transaction bytes.
+    /// Note: This performs a cryptographic hash computation on each call.
+    /// Cache the result if calling multiple times.
     #[must_use]
     pub fn hash(&self) -> TransactionHash {
         keccak256(&self.data)

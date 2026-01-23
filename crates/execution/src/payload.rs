@@ -3,7 +3,7 @@
 use alloy_primitives::B256;
 
 /// Result of executing a block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionResult {
     /// Block hash (computed by reth).
     pub block_hash: B256,

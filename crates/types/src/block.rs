@@ -44,7 +44,7 @@ pub struct Block {
 ///
 /// Contains both the Ethereum-style validator address and the Ed25519 public key
 /// used for signing in the commonware consensus protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     /// Validator Ethereum address (derived from public key).
     pub validator: Address,
@@ -160,9 +160,10 @@ impl Block {
         Self { header, transactions, signatures: Vec::new() }
     }
 
-    /// Compute the block hash.
+    /// Compute the block hash (keccak256 of RLP-encoded header).
     ///
-    /// Hash is keccak256 of RLP-encoded header.
+    /// Note: This performs RLP encoding and cryptographic hash computation on each call.
+    /// Cache the result if calling multiple times.
     #[must_use]
     pub fn hash(&self) -> BlockHash {
         let mut buf = Vec::new();

@@ -7,10 +7,6 @@ pub enum CelestiaError {
     #[error("failed to connect to Celestia: {0}")]
     ConnectionFailed(String),
 
-    /// Failed to submit blob.
-    #[error("failed to submit blob: {0}")]
-    SubmitFailed(String),
-
     /// Failed to submit blob to Celestia.
     #[error("submission failed: {0}")]
     SubmissionFailed(String),

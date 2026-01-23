@@ -69,17 +69,17 @@ impl Au for Mailbox {
 
     async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
         let (response, receiver) = oneshot::channel();
-        let _ = self
-            .sender
-            .try_send(Message::Genesis { epoch, response });
+        if self.sender.try_send(Message::Genesis { epoch, response }).is_err() {
+            tracing::warn!("Failed to send genesis message to application");
+        }
         receiver.await.expect("Failed to receive genesis")
     }
 
     async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (response, receiver) = oneshot::channel();
-        let _ = self
-            .sender
-            .try_send(Message::Propose { context, response });
+        if self.sender.try_send(Message::Propose { context, response }).is_err() {
+            tracing::warn!("Failed to send propose message to application");
+        }
         receiver
     }
 
@@ -89,11 +89,9 @@ impl Au for Mailbox {
         payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.try_send(Message::Verify {
-            context,
-            payload,
-            response,
-        });
+        if self.sender.try_send(Message::Verify { context, payload, response }).is_err() {
+            tracing::warn!("Failed to send verify message to application");
+        }
         receiver
     }
 }
@@ -106,7 +104,9 @@ impl Re for Mailbox {
     type Digest = AppDigest;
 
     async fn broadcast(&mut self, payload: Self::Digest) {
-        let _ = self.sender.try_send(Message::Broadcast { payload });
+        if self.sender.try_send(Message::Broadcast { payload }).is_err() {
+            tracing::warn!("Failed to send broadcast message to application");
+        }
     }
 }
 
@@ -297,11 +297,15 @@ impl Application {
             match message {
                 Message::Genesis { epoch, response } => {
                     let digest = self.genesis(epoch);
-                    let _ = response.send(digest);
+                    if response.send(digest).is_err() {
+                        tracing::warn!("Genesis response receiver dropped");
+                    }
                 }
                 Message::Propose { context, response } => {
                     let digest = self.propose(context).await;
-                    let _ = response.send(digest);
+                    if response.send(digest).is_err() {
+                        tracing::warn!("Propose response receiver dropped");
+                    }
                 }
                 Message::Verify {
                     context,
@@ -309,7 +313,9 @@ impl Application {
                     response,
                 } => {
                     let valid = self.verify(context, payload);
-                    let _ = response.send(valid);
+                    if response.send(valid).is_err() {
+                        tracing::warn!("Verify response receiver dropped");
+                    }
                 }
                 Message::Broadcast { payload } => {
                     self.broadcast(payload);

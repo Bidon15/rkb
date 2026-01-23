@@ -23,6 +23,29 @@ const BLOCK_INTERVAL_MS: u64 = 1000;
 /// Signing namespace for block signatures.
 const BLOCK_SIGNING_NAMESPACE: &[u8] = b"astria-sequencer-block";
 
+/// Get current Unix timestamp in seconds.
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Check if a validator is the leader for a given height.
+#[allow(clippy::cast_possible_truncation)]
+fn is_leader_for_height(validator_index: Option<usize>, height: u64, validators_len: usize) -> bool {
+    validator_index.is_some_and(|idx| (height as usize) % validators_len == idx)
+}
+
+/// Sign a block with the given signer.
+fn sign_block(block: &mut Block, signer: &ed25519::PrivateKey, proposer: Address) {
+    let block_hash = block.hash();
+    let sig = signer.sign(BLOCK_SIGNING_NAMESPACE, block_hash.as_slice());
+    let public_key = signer.public_key();
+    let signature = Signature::new(proposer, &public_key, &sig);
+    block.signatures.push(signature);
+}
+
 /// `PoA` consensus engine.
 pub struct Consensus {
     config: ConsensusConfig,
@@ -103,9 +126,13 @@ impl Consensus {
         }
 
         // Create commonware ed25519 private key from seed
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&key_bytes);
-        let signer = ed25519::PrivateKey::from_seed(u64::from_le_bytes(seed[0..8].try_into().unwrap_or([0u8; 8])));
+        // Use first 8 bytes of the 32-byte seed as u64 for commonware's from_seed()
+        let seed_u64 = u64::from_le_bytes(
+            key_bytes[0..8]
+                .try_into()
+                .expect("key_bytes verified to be 32 bytes, first 8 always succeed"),
+        );
+        let signer = ed25519::PrivateKey::from_seed(seed_u64);
         let public_key = signer.public_key();
 
         // Derive Ethereum address from Ed25519 public key
@@ -134,7 +161,7 @@ impl Consensus {
         let mut buf = &mut bytes[..];
         pubkey.write(&mut buf);
 
-        let hash = keccak256(&bytes);
+        let hash = keccak256(bytes);
         Address::from_slice(&hash[12..])
     }
 
@@ -151,21 +178,11 @@ impl Consensus {
     }
 
     /// Get the current leader for a given height using round-robin.
+    #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     fn leader_for_height(&self, height: u64) -> Address {
         let idx = (height as usize) % self.config.validators.len();
         self.config.validators[idx]
-    }
-
-    /// Check if this node is the leader for the given height.
-    #[allow(clippy::cast_possible_truncation)]
-    fn is_leader(&self, height: u64) -> bool {
-        if let Some(idx) = self.validator_index {
-            let leader_idx = (height as usize) % self.config.validators.len();
-            idx == leader_idx
-        } else {
-            false
-        }
     }
 
     /// Build a new block from the mempool.
@@ -173,33 +190,21 @@ impl Consensus {
     async fn build_block(&self) -> Result<Block> {
         let height = *self.height.read().await;
         let parent_hash = *self.last_hash.read().await;
-
-        // Get transactions from mempool
-        let mut mempool = self.mempool.write().await;
-        let transactions: Vec<Transaction> = mempool.drain(..).collect();
-
-        // Get proposer address
         let proposer = self.leader_for_height(height);
+
+        let transactions: Vec<Transaction> = self.mempool.write().await.drain(..).collect();
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            timestamp: current_timestamp(),
             parent_hash,
             proposer,
         };
 
         let mut block = Block::new(header, transactions);
 
-        // Sign the block
         if let Some(ref signer) = self.signer {
-            let block_hash = block.hash();
-            let sig = signer.sign(BLOCK_SIGNING_NAMESPACE, block_hash.as_slice());
-            let public_key = signer.public_key();
-            let signature = Signature::new(proposer, &public_key, &sig);
-            block.signatures.push(signature);
+            sign_block(&mut block, signer, proposer);
         }
 
         Ok(block)
@@ -221,63 +226,42 @@ impl Consensus {
 
         loop {
             tokio::select! {
-                // Handle incoming transactions
                 Some(tx) = tx_receiver.recv() => {
                     mempool.write().await.push(tx);
                 }
 
-                // Tick for block production
                 _ = block_interval.tick() => {
                     let current_height = *height.read().await;
 
-                    // Check if we're the leader
-                    let is_leader = if let Some(idx) = validator_index {
-                        let leader_idx = (current_height as usize) % validators.len();
-                        idx == leader_idx
-                    } else {
-                        false
-                    };
-
-                    if !is_leader {
+                    if !is_leader_for_height(validator_index, current_height, validators.len()) {
                         continue;
                     }
 
                     tracing::debug!(height = current_height, "We are the leader, producing block");
 
-                    // Build block
                     let parent_hash = *last_hash.read().await;
                     let transactions: Vec<Transaction> = mempool.write().await.drain(..).collect();
                     let proposer = validators[(current_height as usize) % validators.len()];
 
                     let header = BlockHeader {
                         height: current_height,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
+                        timestamp: current_timestamp(),
                         parent_hash,
                         proposer,
                     };
 
                     let mut block = Block::new(header, transactions);
 
-                    // Sign the block
                     if let Some(ref signing_key) = signer {
-                        let block_hash = block.hash();
-                        let sig = signing_key.sign(BLOCK_SIGNING_NAMESPACE, block_hash.as_slice());
-                        let public_key = signing_key.public_key();
-                        let signature = Signature::new(proposer, &public_key, &sig);
-                        block.signatures.push(signature);
+                        sign_block(&mut block, signing_key, proposer);
                     }
 
                     let block_hash = block.hash();
                     let tx_count = block.tx_count();
 
-                    // Update state
                     *height.write().await = current_height + 1;
                     *last_hash.write().await = block_hash;
 
-                    // Broadcast block
                     if block_sender.send(block).is_err() {
                         tracing::debug!("No block receivers");
                     }
@@ -371,12 +355,15 @@ mod tests {
             private_key_path: "/tmp/nonexistent".into(),
             validator_seed: Some(0),
             listen_addr: "0.0.0.0:26656".to_string(),
+            dialable_addr: None,
             p2p_port: 26656,
             peers: vec![],
             leader_timeout_ms: 2000,
             notarization_timeout_ms: 3000,
             nullify_retry_ms: 10000,
             namespace: "test".to_string(),
+            storage_dir: "/tmp/consensus-test".into(),
+            allow_private_ips: true,
         }
     }
 

@@ -12,24 +12,16 @@ use tokio::sync::RwLock;
 ///
 /// In production, this would integrate with the P2P network layer to
 /// actually disconnect and prevent connections from blocked peers.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ConsensusBlocker {
     /// Set of blocked peer public keys.
     blocked: Arc<RwLock<HashSet<Vec<u8>>>>,
 }
 
-impl Default for ConsensusBlocker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ConsensusBlocker {
     /// Create a new blocker.
     pub fn new() -> Self {
-        Self {
-            blocked: Arc::new(RwLock::new(HashSet::new())),
-        }
+        Self::default()
     }
 
     /// Check if a peer is blocked.

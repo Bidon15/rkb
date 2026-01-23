@@ -8,7 +8,7 @@ use alloy_primitives::B256;
 /// - `head`: Latest block (soft confirmation)
 /// - `safe`: Safe block (soft confirmation)
 /// - `finalized`: Finalized block (firm confirmation from Celestia)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ForkchoiceState {
     /// Head block hash (latest soft-confirmed block).
     pub head: B256,
