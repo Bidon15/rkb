@@ -115,6 +115,9 @@ pub fn default_config() -> Config {
             gas_price: 0.002,
             batch_interval_ms: 5000,       // 5 seconds
             max_batch_size_bytes: 1_500_000, // 1.5MB
+            genesis_da_height: 0,          // 0 = skip DA sync (genesis validators)
+            genesis_block_hash: None,
+            index_path: "data/celestia-index".into(),
         },
         execution: ExecutionConfig {
             reth_url: "http://localhost:8551".to_string(),

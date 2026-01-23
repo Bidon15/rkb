@@ -8,8 +8,10 @@
 mod client;
 mod error;
 mod finality;
+mod index;
 
 pub use client::CelestiaClient;
+pub use index::{BlockIndex, IndexEntry};
 pub use error::CelestiaError;
 pub use finality::{FinalityConfirmation, FinalityTracker};
 use futures::Stream;

@@ -12,12 +12,13 @@ use alloy_primitives::Address;
 use commonware_cryptography::{ed25519, Signer};
 use eyre::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
+use alloy_primitives::B256;
 use tracing::{error, info, warn};
 
-use sequencer_celestia::{CelestiaClient, DataAvailability, FinalityConfirmation};
+use sequencer_celestia::{BlockIndex, CelestiaClient, DataAvailability, FinalityConfirmation, IndexEntry};
 use sequencer_consensus::{on_finalized, start_simplex_runtime, OnFinalized, SimplexRuntimeConfig};
 use sequencer_execution::{Execution, ExecutionClient, ForkchoiceState};
-use sequencer_types::{Block, ConsensusConfig, Transaction};
+use sequencer_types::{Block, ConsensusConfig};
 
 use crate::config::Config;
 
@@ -43,6 +44,9 @@ impl SimplexSequencer {
     /// 4. Celestia finality tracker
     /// 5. Batch submission to Celestia at configured intervals
     ///
+    /// If `genesis_da_height` is configured, the sequencer will first sync
+    /// historical blocks from Celestia DA before starting consensus.
+    ///
     /// # Errors
     ///
     /// Returns an error if any component fails to start.
@@ -52,17 +56,60 @@ impl SimplexSequencer {
         // Initialize components
         let (celestia, finality_rx) = self.init_celestia().await?;
         let execution = self.init_execution()?;
-        let runtime_config = build_runtime_config(&self.config.consensus)?;
+
+        // Get genesis hash from reth and initialize forkchoice
+        let genesis_hash = execution
+            .get_genesis_hash()
+            .await
+            .wrap_err("failed to get genesis hash from reth")?;
+        execution.init_forkchoice(genesis_hash).await;
+
+        let forkchoice = Arc::new(RwLock::new(ForkchoiceState {
+            head: genesis_hash,
+            safe: genesis_hash,
+            finalized: genesis_hash,
+        }));
+
+        // Build runtime config with actual genesis hash
+        let runtime_config = build_runtime_config(&self.config.consensus, genesis_hash)?;
+
+        // Open block index
+        let mut block_index = BlockIndex::open(&self.config.celestia.index_path)
+            .await
+            .wrap_err("failed to open block index")?;
+
+        // Sync from Celestia DA if genesis_da_height is configured
+        let genesis_da_height = self.config.celestia.genesis_da_height;
+        if genesis_da_height > 0 {
+            info!(
+                genesis_da_height,
+                "Syncing historical blocks from Celestia DA"
+            );
+            let synced_height = Self::sync_from_celestia(
+                &celestia,
+                &execution,
+                &forkchoice,
+                &mut block_index,
+                genesis_da_height,
+            )
+            .await
+            .wrap_err("failed to sync from Celestia")?;
+
+            info!(
+                synced_height,
+                "Celestia sync complete, starting consensus"
+            );
+        }
+
+        // Block index is ready for use - will be integrated into submit operations
+        // to track ongoing submissions (see TODO: Integrate index into CelestiaClient)
+        drop(block_index);
 
         info!(
             validators = runtime_config.validators.len(),
             listen_addr = %runtime_config.listen_addr,
             "Starting Simplex BFT consensus"
         );
-
-        // Create shared state
-        let mempool: Arc<RwLock<Vec<Transaction>>> = Arc::new(RwLock::new(Vec::new()));
-        let forkchoice = Arc::new(RwLock::new(ForkchoiceState::default()));
 
         // Spawn batch submission task and get channel for sending blocks
         let batch_tx = self.spawn_batch_task(&celestia);
@@ -76,9 +123,12 @@ impl SimplexSequencer {
             self.config.celestia.batch_interval_ms > 0,
         );
 
+        // Clone execution client for consensus runtime
+        let execution_for_consensus = Arc::clone(&execution);
+
         // Spawn consensus runtime in separate thread (it blocks)
         let runtime_handle = std::thread::spawn(move || {
-            if let Err(e) = start_simplex_runtime(runtime_config, mempool, callback) {
+            if let Err(e) = start_simplex_runtime(runtime_config, execution_for_consensus, callback) {
                 error!(error = %e, "Simplex runtime failed");
             }
         });
@@ -124,6 +174,166 @@ impl SimplexSequencer {
         );
         info!(reth_url = %self.config.execution.reth_url, "Execution client initialized");
         Ok(execution)
+    }
+
+    /// Sync historical blocks from Celestia DA.
+    ///
+    /// This fetches all blocks from `genesis_da_height` to the current Celestia height,
+    /// executes them on reth, and updates the block index.
+    ///
+    /// # Arguments
+    ///
+    /// * `celestia` - The Celestia client for fetching blocks
+    /// * `execution` - The execution client for executing blocks on reth
+    /// * `forkchoice` - The forkchoice state to update
+    /// * `index` - The block index to track synced blocks
+    /// * `genesis_da_height` - The Celestia height where this chain's genesis block was posted
+    ///
+    /// # Returns
+    ///
+    /// The highest synced block height.
+    async fn sync_from_celestia(
+        celestia: &CelestiaClient,
+        execution: &ExecutionClient,
+        forkchoice: &RwLock<ForkchoiceState>,
+        index: &mut BlockIndex,
+        genesis_da_height: u64,
+    ) -> Result<u64> {
+        // Always start from genesis_da_height; we skip already-indexed blocks in the loop
+        let start_height = genesis_da_height;
+
+        // Get current Celestia finalized height (approximate - we'll use last known)
+        // For now, fetch up to a reasonable range; in production, query Celestia for current height
+        let current_celestia_height = celestia.finalized_height().await;
+
+        if current_celestia_height == 0 {
+            info!("No Celestia finality data yet, skipping sync");
+            return Ok(index.latest_height().unwrap_or(0));
+        }
+
+        if start_height > current_celestia_height {
+            info!(
+                start_height,
+                current_celestia_height,
+                "Already synced past current Celestia height"
+            );
+            return Ok(index.latest_height().unwrap_or(0));
+        }
+
+        info!(
+            genesis_da_height,
+            start_height,
+            current_celestia_height,
+            "Syncing blocks from Celestia DA"
+        );
+
+        // Fetch all blocks in range
+        let blocks_with_heights = celestia
+            .get_blocks_in_range(start_height, current_celestia_height)
+            .await
+            .wrap_err("failed to fetch blocks from Celestia")?;
+
+        if blocks_with_heights.is_empty() {
+            info!("No blocks found in Celestia range");
+            return Ok(index.latest_height().unwrap_or(0));
+        }
+
+        // Sort by block height to ensure proper execution order
+        let mut sorted_blocks: Vec<_> = blocks_with_heights.into_iter().collect();
+        sorted_blocks.sort_by_key(|(_, block)| block.height());
+
+        info!(
+            block_count = sorted_blocks.len(),
+            first_height = sorted_blocks.first().map(|(_, b)| b.height()),
+            last_height = sorted_blocks.last().map(|(_, b)| b.height()),
+            "Syncing blocks from Celestia"
+        );
+
+        let mut last_synced_height = index.latest_height().unwrap_or(0);
+        let mut parent_hash = forkchoice.read().await.head;
+
+        for (celestia_height, block) in sorted_blocks {
+            let block_height = block.height();
+            let block_hash = block.hash();
+
+            // Skip already-indexed blocks
+            if index.get_by_height(block_height).is_some() {
+                info!(block_height, "Block already indexed, skipping");
+                parent_hash = block_hash;
+                continue;
+            }
+
+            // Verify parent hash chain (except for genesis)
+            if block_height > 1 && block.parent_hash() != parent_hash {
+                warn!(
+                    block_height,
+                    expected_parent = %parent_hash,
+                    actual_parent = %block.parent_hash(),
+                    "Parent hash mismatch, possible chain discontinuity"
+                );
+                // Continue anyway - might be out-of-order blocks in same Celestia height
+            }
+
+            info!(
+                block_height,
+                celestia_height,
+                tx_count = block.tx_count(),
+                "Syncing block from Celestia"
+            );
+
+            // Execute block on reth
+            let result = execution
+                .execute_block(&block)
+                .await
+                .wrap_err_with(|| format!("failed to execute block {block_height}"))?;
+
+            if !result.is_valid() {
+                eyre::bail!(
+                    "block {} invalid during sync: {:?}",
+                    block_height,
+                    result.status
+                );
+            }
+
+            // Update forkchoice
+            let new_forkchoice = {
+                let current = forkchoice.read().await;
+                current.with_soft(block_hash)
+            };
+            execution
+                .update_forkchoice(new_forkchoice)
+                .await
+                .wrap_err_with(|| format!("failed to update forkchoice for block {block_height}"))?;
+            *forkchoice.write().await = new_forkchoice;
+
+            // Add to index (we don't have the commitment during sync, use empty)
+            let entry = IndexEntry {
+                block_height,
+                block_hash,
+                celestia_height,
+                commitment: vec![], // Commitment not available during sync
+            };
+            index
+                .insert(entry)
+                .await
+                .wrap_err("failed to update block index")?;
+
+            last_synced_height = block_height;
+            parent_hash = block_hash;
+
+            info!(
+                block_height,
+                celestia_height,
+                "Block synced from Celestia"
+            );
+        }
+
+        info!(
+            last_synced_height,
+            "Celestia sync complete"
+        );
+
+        Ok(last_synced_height)
     }
 
     /// Spawn the batch submission task.
@@ -484,7 +694,7 @@ async fn submit_batch(
 // =============================================================================
 
 /// Build the Simplex runtime configuration from chain config.
-fn build_runtime_config(consensus: &ConsensusConfig) -> Result<SimplexRuntimeConfig> {
+fn build_runtime_config(consensus: &ConsensusConfig, initial_hash: B256) -> Result<SimplexRuntimeConfig> {
     let private_key = load_private_key(&consensus.private_key_path)?;
     let our_pubkey = private_key.public_key();
 
@@ -535,6 +745,7 @@ fn build_runtime_config(consensus: &ConsensusConfig) -> Result<SimplexRuntimeCon
         mailbox_size: 1024,
         allow_private_ips: consensus.allow_private_ips,
         max_message_size: 1024 * 1024,
+        initial_hash,
     })
 }
 

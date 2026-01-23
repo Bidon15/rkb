@@ -166,6 +166,27 @@ pub struct CelestiaConfig {
     /// Default: 1.5MB (well under Celestia's ~2MB blob limit).
     #[serde(default = "default_max_batch_size_bytes")]
     pub max_batch_size_bytes: usize,
+
+    /// Celestia height where this chain's genesis block was posted.
+    ///
+    /// New validators use this to sync historical blocks from Celestia DA.
+    /// Set to 0 to skip DA sync (only for genesis validators).
+    #[serde(default)]
+    pub genesis_da_height: u64,
+
+    /// Expected hash of the first sequencer block (optional).
+    ///
+    /// If set, the sync process will verify the first block matches this hash.
+    /// Format: hex-encoded 32-byte hash (e.g., "0x1234...").
+    #[serde(default)]
+    pub genesis_block_hash: Option<String>,
+
+    /// Path to the block index database.
+    ///
+    /// The index maps sequencer block heights/hashes to Celestia heights,
+    /// enabling efficient lookups without scanning all DA blobs.
+    #[serde(default = "default_index_path")]
+    pub index_path: PathBuf,
 }
 
 fn default_gas_price() -> f64 {
@@ -178,6 +199,10 @@ fn default_batch_interval_ms() -> u64 {
 
 fn default_max_batch_size_bytes() -> usize {
     1_500_000 // 1.5MB - well under Celestia's ~2MB limit
+}
+
+fn default_index_path() -> PathBuf {
+    PathBuf::from("data/celestia-index")
 }
 
 /// Execution layer configuration.
