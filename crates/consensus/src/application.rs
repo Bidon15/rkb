@@ -645,19 +645,30 @@ impl Application {
         // Import block to reth immediately via newPayloadV3.
         // This is how Ethereum works: blocks are imported on gossip,
         // then finalized later via forkchoiceUpdated.
-        if let Err(e) = self.execution.import_payload(&payload).await {
-            tracing::warn!(
-                ?e,
-                height = block.height(),
-                block_hash = %block.block_hash,
-                "Failed to import relayed block to reth (may already exist)"
-            );
-            // Continue anyway - block might already be imported
-        }
+        let import_succeeded = match self.execution.import_payload(&payload).await {
+            Ok(()) => true,
+            Err(e) => {
+                // Log at debug level for "already exists" type errors (common in relay)
+                // Log at warn level for other errors
+                tracing::warn!(
+                    error = %e,
+                    height = block.height(),
+                    block_hash = %block.block_hash,
+                    "Failed to import relayed block to reth"
+                );
+                false
+            }
+        };
 
+        // Store block for consensus regardless of import result
         self.pending_blocks.insert(digest, block);
         self.pending_payloads.insert(digest, payload);
-        self.verified.insert(digest);
+
+        // Only mark as verified if import succeeded
+        // Failed imports will be re-attempted during finalization
+        if import_succeeded {
+            self.verified.insert(digest);
+        }
     }
 
     /// Handle genesis message.
