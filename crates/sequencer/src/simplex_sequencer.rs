@@ -593,10 +593,13 @@ async fn run_batch_submission_loop(
     batch_interval_ms: u64,
     max_batch_size_bytes: usize,
 ) {
+    const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
     let mut ticker = tokio::time::interval(Duration::from_millis(batch_interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut state = BatchState::new();
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         let action = wait_for_batch_event(&mut batch_rx, &mut ticker, &mut state, max_batch_size_bytes).await;
@@ -604,11 +607,22 @@ async fn run_batch_submission_loop(
         match action {
             BatchAction::Continue => {}
             BatchAction::Submit => {
-                submit_batch(&celestia, &mut state).await;
+                if submit_batch(&celestia, &mut state).await {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            consecutive_failures,
+                            "Batch submission loop exiting after max consecutive failures"
+                        );
+                        break;
+                    }
+                }
                 ticker.reset();
             }
             BatchAction::Shutdown => {
-                submit_batch(&celestia, &mut state).await;
+                let _ = submit_batch(&celestia, &mut state).await;
                 break;
             }
         }
@@ -856,19 +870,27 @@ fn estimate_block_size(block: &Block) -> usize {
 }
 
 /// Submit a batch of blocks to Celestia.
-async fn submit_batch(celestia: &CelestiaClient, state: &mut BatchState) {
+///
+/// Returns true on success, false on failure (blocks restored for retry).
+async fn submit_batch(celestia: &CelestiaClient, state: &mut BatchState) -> bool {
     let blocks = std::mem::take(&mut state.pending_blocks);
     state.pending_size = 0;
 
     if blocks.is_empty() {
-        return;
+        return true; // Nothing to submit is success
     }
 
     log_batch_submission(&blocks);
 
     match celestia.submit_blocks(&blocks).await {
-        Ok(submissions) => log_batch_success(celestia, submissions),
-        Err(e) => restore_failed_batch(state, blocks, &e),
+        Ok(submissions) => {
+            log_batch_success(celestia, submissions);
+            true
+        }
+        Err(e) => {
+            restore_failed_batch(state, blocks, &e);
+            false
+        }
     }
 }
 
