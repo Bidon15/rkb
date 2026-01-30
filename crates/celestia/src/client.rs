@@ -212,24 +212,45 @@ impl CelestiaClient {
     ///
     /// This subscribes to Celestia headers and emits finality confirmations
     /// when blocks become finalized. If the subscription drops, it will
-    /// automatically reconnect.
+    /// automatically reconnect with exponential backoff.
     ///
     /// # Errors
     ///
-    /// Returns an error if the subscription fails permanently.
+    /// Returns an error if max consecutive failures is reached.
     pub async fn run_finality_tracker(&self) -> Result<()> {
         tracing::info!("Starting Celestia finality tracker");
 
+        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+        const MAX_BACKOFF_MS: u64 = 60_000; // 1 minute max
+
+        let mut consecutive_failures: u32 = 0;
+
         loop {
-            if let Err(e) = self.run_header_subscription().await {
-                tracing::error!(error = %e, "Header subscription failed");
+            match self.run_header_subscription().await {
+                Ok(()) => {
+                    // Subscription ended normally (shouldn't happen)
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        error = %e,
+                        consecutive_failures,
+                        max_failures = MAX_CONSECUTIVE_FAILURES,
+                        "Header subscription failed"
+                    );
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        return Err(CelestiaError::SubscriptionFailed(format!(
+                            "max consecutive failures ({MAX_CONSECUTIVE_FAILURES}) reached"
+                        )));
+                    }
+                }
             }
 
-            tracing::info!(
-                delay_ms = DEFAULT_RECONNECT_DELAY_MS,
-                "Reconnecting to header subscription..."
-            );
-            tokio::time::sleep(Duration::from_millis(DEFAULT_RECONNECT_DELAY_MS)).await;
+            let backoff_ms = calculate_backoff(consecutive_failures, DEFAULT_RECONNECT_DELAY_MS, MAX_BACKOFF_MS);
+            tracing::info!(backoff_ms, consecutive_failures, "Reconnecting to header subscription...");
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
     }
 
@@ -570,6 +591,12 @@ impl DataAvailability for CelestiaClient {
             tracker.write().await.track(&submission);
         });
     }
+}
+
+/// Calculate exponential backoff with a maximum cap.
+fn calculate_backoff(failures: u32, base_delay_ms: u64, max_delay_ms: u64) -> u64 {
+    let backoff = base_delay_ms.saturating_mul(2u64.saturating_pow(failures.saturating_sub(1)));
+    backoff.min(max_delay_ms)
 }
 
 #[cfg(test)]
