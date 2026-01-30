@@ -27,21 +27,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
-use sequencer_execution::ExecutionClient;
 use commonware_consensus::{
     simplex::{
-        config::Config as EngineConfig,
-        elector::RoundRobin,
-        scheme::ed25519::Scheme,
-        Engine,
+        config::Config as EngineConfig, elector::RoundRobin, scheme::ed25519::Scheme, Engine,
     },
     types::{Epoch, ViewDelta},
 };
-use commonware_p2p::Blocker;
 use commonware_cryptography::{ed25519, Sha256, Signer};
+use commonware_p2p::Blocker;
 use commonware_p2p::{
-    authenticated::discovery,
-    CheckedSender, LimitedSender, Manager, Receiver, Recipients,
+    authenticated::discovery, CheckedSender, LimitedSender, Manager, Receiver, Recipients,
 };
 use commonware_parallel::Sequential;
 use commonware_runtime::{
@@ -51,6 +46,7 @@ use commonware_runtime::{
 };
 use commonware_utils::{ordered::Set, union};
 use rand::{CryptoRng, RngCore};
+use sequencer_execution::ExecutionClient;
 use sequencer_types::{Block, BlockTiming, ConsensusConfig};
 
 use crate::application::{AppDigest, Application, ApplicationConfig, Mailbox, ProposedBlock};
@@ -240,15 +236,11 @@ pub fn start_simplex_runtime<C: OnFinalized>(
     callback: C,
 ) -> Result<()> {
     if !config.is_validator() {
-        return Err(ConsensusError::InvalidConfig(
-            "not in validator set".to_string(),
-        ));
+        return Err(ConsensusError::InvalidConfig("not in validator set".to_string()));
     }
 
     if config.validators.is_empty() {
-        return Err(ConsensusError::InvalidConfig(
-            "validator set is empty".to_string(),
-        ));
+        return Err(ConsensusError::InvalidConfig("validator set is empty".to_string()));
     }
 
     // Create runtime configuration
@@ -259,9 +251,7 @@ pub fn start_simplex_runtime<C: OnFinalized>(
 
     // Start the runtime
     let runner = Runner::new(runtime_config);
-    runner.start(|context| async move {
-        run_simplex(context, config, execution, callback).await
-    });
+    runner.start(|context| async move { run_simplex(context, config, execution, callback).await });
 
     Ok(())
 }
@@ -276,78 +266,39 @@ async fn run_simplex<E, C>(
     E: Spawner + Clock + CryptoRng + RngCore + RNetwork + Resolver + Metrics + Storage + Clone + Send + 'static,
     C: OnFinalized,
 {
-    tracing::info!(
-        validators = config.validators.len(),
-        epoch = config.epoch,
-        "Starting Simplex BFT consensus"
-    );
+    tracing::info!(validators = config.validators.len(), epoch = config.epoch, "Starting Simplex BFT consensus");
 
-    // Setup P2P network
+    // Setup P2P network and participants
     let p2p_config = build_p2p_config(&config);
-    let (mut network, mut oracle) =
-        discovery::Network::new(context.clone().with_label("p2p"), p2p_config);
-
-    // Create ordered participant set and register with oracle
+    let (mut network, mut oracle) = discovery::Network::new(context.clone().with_label("p2p"), p2p_config);
     let participants: Set<ed25519::PublicKey> = Set::from_iter_dedup(config.validators.iter().cloned());
     oracle.update(config.epoch, participants.clone()).await;
 
-    // Register all network channels for consensus
-    let (vote_sender, vote_receiver) = network.register(
-        u64::from(channels::VOTE),
-        rate_limits::vote(),
-        backlog::VOTE,
-    );
-    let (cert_sender, cert_receiver) = network.register(
-        u64::from(channels::CERTIFICATE),
-        rate_limits::certificate(),
-        backlog::CERTIFICATE,
-    );
-    let (resolver_sender, resolver_receiver) = network.register(
-        u64::from(channels::RESOLVER),
-        rate_limits::resolver(),
-        backlog::RESOLVER,
-    );
-    let (block_relay_sender, block_relay_receiver) = network.register(
-        u64::from(channels::BLOCK_RELAY),
-        rate_limits::block_relay(),
-        backlog::BLOCK_RELAY,
-    );
+    // Register consensus channels
+    let (vote_tx, vote_rx) = network.register(u64::from(channels::VOTE), rate_limits::vote(), backlog::VOTE);
+    let (cert_tx, cert_rx) = network.register(u64::from(channels::CERTIFICATE), rate_limits::certificate(), backlog::CERTIFICATE);
+    let (resolver_tx, resolver_rx) = network.register(u64::from(channels::RESOLVER), rate_limits::resolver(), backlog::RESOLVER);
+    let (relay_tx, relay_rx) = network.register(u64::from(channels::BLOCK_RELAY), rate_limits::block_relay(), backlog::BLOCK_RELAY);
     let network_handle = network.start();
 
-    // Setup application
-    let (application, app_mailbox, block_receiver, block_relay_receiver_local) =
-        create_application(&config, execution);
+    // Setup and spawn application
+    let (application, app_mailbox, block_receiver, relay_local) = create_application(&config, execution);
+    context.clone().with_label("application").spawn(|_| async move { application.run().await; });
 
-    // Spawn application actor
-    context.clone().with_label("application").spawn(|_| async move {
-        application.run().await;
-    });
-
-    // Create and start consensus engine
+    // Start consensus engine
     let engine_config = build_engine_config(&config, &participants, oracle, app_mailbox.clone());
     let engine = Engine::new(context.clone().with_label("simplex"), engine_config);
-    let engine_handle = engine.start(
-        (vote_sender, vote_receiver),
-        (cert_sender, cert_receiver),
-        (resolver_sender, resolver_receiver),
-    );
+    let engine_handle = engine.start((vote_tx, vote_rx), (cert_tx, cert_rx), (resolver_tx, resolver_rx));
 
     // Spawn block relay task
     let participants_clone = participants.clone();
     context.clone().with_label("block_relay").spawn(move |_| async move {
-        run_block_relay(
-            block_relay_sender,
-            block_relay_receiver,
-            block_relay_receiver_local,
-            app_mailbox,
-            participants_clone,
-        ).await;
+        run_block_relay(relay_tx, relay_rx, relay_local, app_mailbox, participants_clone).await;
     });
 
-    // Run finalization loop
+    // Run finalization loop until shutdown
     run_finalization_loop(context, config, callback, block_receiver, participants).await;
 
-    // Cleanup
     drop(engine_handle);
     drop(network_handle);
 }
@@ -408,7 +359,16 @@ fn build_engine_config<O>(
     participants: &Set<ed25519::PublicKey>,
     oracle: O,
     app_mailbox: Mailbox,
-) -> EngineConfig<Scheme, RoundRobin<Sha256>, O, AppDigest, Mailbox, Mailbox, ConsensusReporter, Sequential>
+) -> EngineConfig<
+    Scheme,
+    RoundRobin<Sha256>,
+    O,
+    AppDigest,
+    Mailbox,
+    Mailbox,
+    ConsensusReporter,
+    Sequential,
+>
 where
     O: Blocker<PublicKey = ed25519::PublicKey>,
 {
@@ -443,6 +403,53 @@ where
     }
 }
 
+/// Result of receiving a finalized block.
+enum BlockReceiveResult {
+    /// Block received successfully.
+    Block(Block),
+    /// Receiver error, should stop.
+    Error,
+    /// Runtime stopped.
+    Stopped,
+}
+
+/// Handle a received finalized block.
+async fn handle_finalized_block<C: OnFinalized>(
+    callback: &C,
+    block: Block,
+    our_index: usize,
+    num_validators: usize,
+) {
+    let is_leader = crate::leader::is_leader(our_index, block.height(), num_validators);
+    tracing::info!(height = block.height(), is_leader, tx_count = block.tx_count(), "Block finalized");
+
+    if let Err(e) = callback.on_finalized(block, is_leader).await {
+        tracing::error!(error = %e, "Finalization callback failed");
+    }
+}
+
+/// Wait for next block or stop signal.
+async fn wait_for_block<E: Clock + Spawner>(
+    context: &E,
+    receiver: &mut tokio::sync::broadcast::Receiver<Block>,
+) -> BlockReceiveResult {
+    tokio::select! {
+        result = receiver.recv() => {
+            match result {
+                Ok(block) => BlockReceiveResult::Block(block),
+                Err(e) => {
+                    tracing::error!(error = %e, "Block receiver error");
+                    BlockReceiveResult::Error
+                }
+            }
+        }
+        _ = context.stopped() => {
+            tracing::info!("Runtime stopped, shutting down consensus");
+            BlockReceiveResult::Stopped
+        }
+    }
+}
+
 /// Run the main finalization loop.
 async fn run_finalization_loop<E, C>(
     context: E,
@@ -458,33 +465,11 @@ async fn run_finalization_loop<E, C>(
     let num_validators = participants.len();
 
     loop {
-        tokio::select! {
-            block_result = block_receiver.recv() => {
-                match block_result {
-                    Ok(block) => {
-                        let is_leader = crate::leader::is_leader(our_index, block.height(), num_validators);
-
-                        tracing::info!(
-                            height = block.height(),
-                            is_leader,
-                            tx_count = block.tx_count(),
-                            "Block finalized"
-                        );
-
-                        if let Err(e) = callback.on_finalized(block, is_leader).await {
-                            tracing::error!(error = %e, "Finalization callback failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Block receiver error");
-                        break;
-                    }
-                }
+        match wait_for_block(&context, &mut block_receiver).await {
+            BlockReceiveResult::Block(block) => {
+                handle_finalized_block(&callback, block, our_index, num_validators).await;
             }
-            _ = context.stopped() => {
-                tracing::info!("Runtime stopped, shutting down consensus");
-                break;
-            }
+            BlockReceiveResult::Error | BlockReceiveResult::Stopped => break,
         }
     }
 }
@@ -519,6 +504,34 @@ where
     }
 }
 
+/// Serialize a proposed block, returning None on error.
+fn serialize_proposed_block(proposed: &ProposedBlock) -> Option<Vec<u8>> {
+    match bincode::serialize(proposed) {
+        Ok(bytes) => {
+            tracing::debug!(height = proposed.block.height(), size = bytes.len(), "Serialized block for broadcast");
+            Some(bytes)
+        }
+        Err(e) => {
+            tracing::error!(?e, "Failed to serialize proposed block");
+            None
+        }
+    }
+}
+
+/// Send encoded block to recipients.
+async fn send_to_recipients<S>(sender: &mut S, recipients: Vec<ed25519::PublicKey>, encoded: &[u8])
+where
+    S: LimitedSender<PublicKey = ed25519::PublicKey> + Send,
+{
+    let Ok(checked) = sender.check(Recipients::Some(recipients)).await else {
+        tracing::debug!("Rate limited, skipping broadcast");
+        return;
+    };
+    if let Err(e) = checked.send(encoded, true).await {
+        tracing::warn!(?e, "Failed to broadcast proposed block");
+    }
+}
+
 /// Broadcast a proposed block to all validators.
 async fn broadcast_proposed_block<S>(
     sender: &mut S,
@@ -527,32 +540,9 @@ async fn broadcast_proposed_block<S>(
 ) where
     S: LimitedSender<PublicKey = ed25519::PublicKey> + Send,
 {
-    let encoded = match bincode::serialize(proposed) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(?e, "Failed to serialize proposed block");
-            return;
-        }
-    };
-
-    tracing::debug!(
-        height = proposed.block.height(),
-        digest = ?proposed.digest,
-        size = encoded.len(),
-        "Broadcasting proposed block to validators"
-    );
-
+    let Some(encoded) = serialize_proposed_block(proposed) else { return };
     let recipients: Vec<_> = participants.iter().cloned().collect();
-    match sender.check(Recipients::Some(recipients)).await {
-        Ok(checked) => {
-            if let Err(e) = checked.send(encoded.as_slice(), true).await {
-                tracing::warn!(?e, "Failed to broadcast proposed block");
-            }
-        }
-        Err(next_time) => {
-            tracing::debug!(?next_time, "Rate limited, skipping broadcast");
-        }
-    }
+    send_to_recipients(sender, recipients, &encoded).await;
 }
 
 /// Handle block received from P2P - forward to local application.
