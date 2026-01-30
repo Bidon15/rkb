@@ -164,7 +164,8 @@ impl ExecutionClient {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
         for attempt in 1..=MAX_RETRIES {
-            if self.try_init_forkchoice(state, genesis_hash, attempt, MAX_RETRIES).await? {
+            let is_last = attempt == MAX_RETRIES;
+            if self.try_init_forkchoice(state, attempt, is_last).await? {
                 return Ok(());
             }
             tokio::time::sleep(RETRY_DELAY).await;
@@ -174,21 +175,15 @@ impl ExecutionClient {
     }
 
     /// Try to initialize forkchoice once. Returns Ok(true) on success, Ok(false) to retry.
-    async fn try_init_forkchoice(
-        &self,
-        state: ForkchoiceState,
-        genesis_hash: B256,
-        attempt: u32,
-        max_retries: u32,
-    ) -> Result<bool> {
+    async fn try_init_forkchoice(&self, state: ForkchoiceState, attempt: u32, is_last_attempt: bool) -> Result<bool> {
         match self.update_forkchoice(state).await {
             Ok(()) => {
-                tracing::info!(%genesis_hash, attempt, "Forkchoice initialized with genesis on reth");
+                tracing::info!(genesis_hash = %state.head, attempt, "Forkchoice initialized with genesis on reth");
                 Ok(true)
             }
-            Err(e) if attempt < max_retries => {
+            Err(e) if !is_last_attempt => {
                 tracing::warn!(
-                    %genesis_hash, attempt, max_retries, error = %e,
+                    genesis_hash = %state.head, attempt, error = %e,
                     "Forkchoice init failed, reth may be starting up. Retrying..."
                 );
                 Ok(false)
