@@ -51,85 +51,14 @@ impl CelestiaClient {
         config: CelestiaConfig,
         finality_tx: mpsc::Sender<FinalityConfirmation>,
     ) -> Result<Self> {
-        if config.bridge_addr.is_empty() {
-            return Err(CelestiaError::InvalidConfig(
-                "bridge_addr cannot be empty".to_string(),
-            ));
-        }
+        Self::validate_config(&config)?;
 
-        if config.core_grpc_addr.is_empty() {
-            return Err(CelestiaError::InvalidConfig(
-                "core_grpc_addr cannot be empty".to_string(),
-            ));
-        }
-
-        // Parse namespace from config (hex-encoded bytes)
-        let namespace_bytes = hex::decode(&config.namespace).map_err(|e| {
-            CelestiaError::InvalidConfig(format!("invalid namespace hex: {e}"))
-        })?;
-
-        let namespace = Namespace::new_v0(&namespace_bytes).map_err(|e| {
-            CelestiaError::InvalidConfig(format!("invalid namespace: {e}"))
-        })?;
-
-        // Load Celestia signing key (hex-encoded secp256k1 private key)
-        let private_key_hex = if config.celestia_key_path.exists() {
-            let key = std::fs::read_to_string(&config.celestia_key_path).map_err(|e| {
-                CelestiaError::InvalidConfig(format!("failed to read celestia key: {e}"))
-            })?;
-            key.trim().to_string()
-        } else {
-            return Err(CelestiaError::InvalidConfig(format!(
-                "celestia key not found at {}",
-                config.celestia_key_path.display()
-            )));
-        };
-
-        // Build gRPC URL with proper scheme based on TLS setting
+        let namespace = Self::parse_namespace(&config.namespace)?;
+        let private_key_hex = Self::load_private_key(&config.celestia_key_path)?;
         let grpc_url = Self::build_grpc_url(&config.core_grpc_addr, config.core_grpc_tls_enabled);
 
-        // Create Lumina client builder
-        let mut builder = ClientBuilder::new()
-            .rpc_url(&config.bridge_addr)
-            .grpc_url(&grpc_url)
-            .private_key_hex(&private_key_hex);
-
-        // Add bridge auth token if provided
-        if !config.bridge_auth_token.is_empty() {
-            builder = builder.rpc_auth_token(&config.bridge_auth_token);
-        }
-
-        // Add gRPC auth token as metadata if provided
-        if !config.core_grpc_auth_token.is_empty() {
-            builder = builder.grpc_metadata("authorization", &config.core_grpc_auth_token);
-        }
-
-        let lumina_client = builder
-            .build()
-            .await
-            .map_err(|e| CelestiaError::ConnectionFailed(format!("lumina client: {e}")))?;
-
-        let address_str = lumina_client
-            .address()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-
-        tracing::info!(
-            bridge_addr = %config.bridge_addr,
-            core_grpc_addr = %grpc_url,
-            address = %address_str,
-            "Lumina client initialized for blob submission"
-        );
-
-        // Create RPC client for header subscription (finality tracking)
-        let rpc_auth = if config.bridge_auth_token.is_empty() {
-            None
-        } else {
-            Some(config.bridge_auth_token.as_str())
-        };
-        let rpc_client = RpcClient::new(&config.bridge_addr, rpc_auth, None, None)
-            .await
-            .map_err(|e| CelestiaError::ConnectionFailed(format!("rpc client: {e}")))?;
+        let lumina_client = Self::build_lumina_client(&config, &grpc_url, &private_key_hex).await?;
+        let rpc_client = Self::build_rpc_client(&config).await?;
 
         let finality_tracker = Arc::new(RwLock::new(FinalityTracker::new()));
         let (finality_broadcast, _) = broadcast::channel(100);
@@ -150,6 +79,72 @@ impl CelestiaClient {
             finality_tx,
             finality_broadcast,
         })
+    }
+
+    /// Validate configuration fields.
+    fn validate_config(config: &CelestiaConfig) -> Result<()> {
+        if config.bridge_addr.is_empty() {
+            return Err(CelestiaError::InvalidConfig("bridge_addr cannot be empty".into()));
+        }
+        if config.core_grpc_addr.is_empty() {
+            return Err(CelestiaError::InvalidConfig("core_grpc_addr cannot be empty".into()));
+        }
+        Ok(())
+    }
+
+    /// Parse namespace from hex-encoded config string.
+    fn parse_namespace(namespace_hex: &str) -> Result<Namespace> {
+        let bytes = hex::decode(namespace_hex)
+            .map_err(|e| CelestiaError::InvalidConfig(format!("invalid namespace hex: {e}")))?;
+        Namespace::new_v0(&bytes)
+            .map_err(|e| CelestiaError::InvalidConfig(format!("invalid namespace: {e}")))
+    }
+
+    /// Load private key from file path.
+    fn load_private_key(path: &std::path::Path) -> Result<String> {
+        if !path.exists() {
+            return Err(CelestiaError::InvalidConfig(format!(
+                "celestia key not found at {}",
+                path.display()
+            )));
+        }
+        let key = std::fs::read_to_string(path)
+            .map_err(|e| CelestiaError::InvalidConfig(format!("failed to read celestia key: {e}")))?;
+        Ok(key.trim().to_string())
+    }
+
+    /// Build the Lumina gRPC client.
+    async fn build_lumina_client(
+        config: &CelestiaConfig,
+        grpc_url: &str,
+        private_key_hex: &str,
+    ) -> Result<LuminaClient> {
+        let mut builder = ClientBuilder::new()
+            .rpc_url(&config.bridge_addr)
+            .grpc_url(grpc_url)
+            .private_key_hex(private_key_hex);
+
+        if !config.bridge_auth_token.is_empty() {
+            builder = builder.rpc_auth_token(&config.bridge_auth_token);
+        }
+        if !config.core_grpc_auth_token.is_empty() {
+            builder = builder.grpc_metadata("authorization", &config.core_grpc_auth_token);
+        }
+
+        let client = builder.build().await
+            .map_err(|e| CelestiaError::ConnectionFailed(format!("lumina client: {e}")))?;
+
+        let address_str = client.address().map_or_else(|_| "unknown".into(), |a| a.to_string());
+        tracing::info!(bridge_addr = %config.bridge_addr, core_grpc_addr = %grpc_url, address = %address_str, "Lumina client initialized");
+
+        Ok(client)
+    }
+
+    /// Build the RPC client for header subscription.
+    async fn build_rpc_client(config: &CelestiaConfig) -> Result<RpcClient> {
+        let auth = if config.bridge_auth_token.is_empty() { None } else { Some(config.bridge_auth_token.as_str()) };
+        RpcClient::new(&config.bridge_addr, auth, None, None).await
+            .map_err(|e| CelestiaError::ConnectionFailed(format!("rpc client: {e}")))
     }
 
     /// Build gRPC URL with proper scheme based on TLS setting.
@@ -334,136 +329,80 @@ impl CelestiaClient {
     pub async fn get_blocks(&self, celestia_height: u64) -> Result<Vec<Block>> {
         tracing::debug!(celestia_height, "Fetching blocks from Celestia");
 
-        // Use RPC client to get blobs (BlobClient trait)
-        use celestia_rpc::BlobClient;
-        let blobs = self
-            .rpc_client
-            .blob_get_all(celestia_height, &[self.namespace])
-            .await
-            .map_err(|e| CelestiaError::Internal(format!("failed to fetch blobs: {e}")))?;
-
-        let Some(blob_list) = blobs else {
+        let blob_list = self.fetch_blobs(celestia_height).await?;
+        let Some(blobs) = blob_list else {
             tracing::debug!(celestia_height, "No blobs found at height");
             return Ok(vec![]);
         };
 
-        let blocks: Vec<_> = blob_list
-            .iter()
-            .filter_map(|blob| {
-                Self::decode_block(&blob.data)
-                    .inspect(|block| {
-                        tracing::debug!(
-                            celestia_height,
-                            block_height = block.height(),
-                            "Retrieved block from Celestia"
-                        );
-                    })
-                    .inspect_err(|e| {
-                        tracing::trace!(
-                            celestia_height,
-                            error = %e,
-                            "Skipping blob that failed to decode"
-                        );
-                    })
-                    .ok()
-            })
-            .collect();
-
+        let mut blocks = Vec::new();
+        for blob in &blobs {
+            let Some(block) = Self::try_decode_blob(blob, celestia_height) else { continue };
+            blocks.push(block);
+        }
         Ok(blocks)
+    }
+
+    /// Fetch blobs from Celestia at a given height.
+    async fn fetch_blobs(&self, celestia_height: u64) -> Result<Option<Vec<Blob>>> {
+        use celestia_rpc::BlobClient;
+        self.rpc_client
+            .blob_get_all(celestia_height, &[self.namespace])
+            .await
+            .map_err(|e| CelestiaError::Internal(format!("failed to fetch blobs: {e}")))
+    }
+
+    /// Try to decode a blob as a block, logging failures.
+    fn try_decode_blob(blob: &Blob, celestia_height: u64) -> Option<Block> {
+        match Self::decode_block(&blob.data) {
+            Ok(block) => {
+                tracing::debug!(celestia_height, block_height = block.height(), "Retrieved block");
+                Some(block)
+            }
+            Err(e) => {
+                tracing::trace!(celestia_height, error = %e, "Skipping blob that failed to decode");
+                None
+            }
+        }
     }
 
     /// Get all blocks in a range of Celestia heights.
     ///
-    /// Useful for syncing a node from Celestia DA.
-    ///
-    /// # Arguments
-    ///
-    /// * `start_height` - First Celestia height to fetch (inclusive)
-    /// * `end_height` - Last Celestia height to fetch (inclusive)
-    ///
-    /// # Returns
-    ///
-    /// A vector of `(celestia_height, block)` tuples, sorted by Celestia height.
-    ///
     /// # Errors
     ///
     /// Returns an error if any retrieval fails.
-    pub async fn get_blocks_in_range(
-        &self,
-        start_height: u64,
-        end_height: u64,
-    ) -> Result<Vec<(u64, Block)>> {
-        if start_height > end_height {
+    pub async fn get_blocks_in_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Block)>> {
+        if start > end {
             return Ok(vec![]);
         }
 
-        tracing::info!(
-            start_height,
-            end_height,
-            "Fetching blocks from Celestia range"
-        );
+        tracing::info!(start_height = start, end_height = end, "Fetching blocks from Celestia range");
 
         let mut all_blocks = Vec::new();
-
-        for celestia_height in start_height..=end_height {
-            let blocks = self.get_blocks(celestia_height).await?;
-            for block in blocks {
-                all_blocks.push((celestia_height, block));
-            }
+        for height in start..=end {
+            let blocks = self.get_blocks(height).await?;
+            all_blocks.extend(blocks.into_iter().map(|b| (height, b)));
         }
 
-        tracing::info!(
-            start_height,
-            end_height,
-            block_count = all_blocks.len(),
-            "Retrieved blocks from Celestia range"
-        );
-
+        tracing::info!(start_height = start, end_height = end, block_count = all_blocks.len(), "Retrieved blocks");
         Ok(all_blocks)
     }
 
     /// Verify that a blob is included at the given Celestia height.
     ///
-    /// This checks that a blob with the given commitment exists at the
-    /// specified height in our namespace.
-    ///
     /// # Errors
     ///
     /// Returns an error if verification fails.
-    pub async fn verify_inclusion(
-        &self,
-        celestia_height: u64,
-        commitment: &[u8],
-    ) -> Result<bool> {
-        tracing::debug!(
-            celestia_height,
-            commitment_len = commitment.len(),
-            "Verifying blob inclusion"
-        );
+    pub async fn verify_inclusion(&self, celestia_height: u64, commitment: &[u8]) -> Result<bool> {
+        tracing::debug!(celestia_height, commitment_len = commitment.len(), "Verifying blob inclusion");
 
-        // Get all blobs at this height in our namespace
-        use celestia_rpc::BlobClient;
-        let blobs = self
-            .rpc_client
-            .blob_get_all(celestia_height, &[self.namespace])
-            .await
-            .map_err(|e| CelestiaError::Internal(format!("failed to fetch blobs: {e}")))?;
-
-        let Some(blob_list) = blobs else {
+        let Some(blobs) = self.fetch_blobs(celestia_height).await? else {
             tracing::debug!(celestia_height, "No blobs found at height");
             return Ok(false);
         };
 
-        let found = blob_list
-            .iter()
-            .any(|blob| Self::commitment_to_bytes(blob.commitment.into()) == commitment);
-
-        if found {
-            tracing::debug!(celestia_height, "Blob inclusion verified");
-        } else {
-            tracing::debug!(celestia_height, "Blob not found with matching commitment");
-        }
-
+        let found = blobs.iter().any(|b| Self::commitment_to_bytes(b.commitment.into()) == commitment);
+        tracing::debug!(celestia_height, found, "Blob inclusion check complete");
         Ok(found)
     }
 
@@ -496,12 +435,14 @@ impl CelestiaClient {
     }
 }
 
+/// Block info for submission tracking.
+struct BlockInfo {
+    hash: B256,
+    height: u64,
+}
+
 impl CelestiaClient {
     /// Submit multiple blocks as a batch to Celestia.
-    ///
-    /// This creates one blob per block and submits them all in a single
-    /// PayForBlobs transaction, which is more efficient than submitting
-    /// blocks individually.
     ///
     /// # Errors
     ///
@@ -518,62 +459,55 @@ impl CelestiaClient {
             "Submitting block batch to Celestia"
         );
 
-        // Get our address for blob creation
-        let address = self.lumina_client.address().map_err(|e| {
-            CelestiaError::Internal(format!("failed to get address: {e}"))
-        })?;
+        let (blobs, block_infos) = self.create_blobs_for_blocks(blocks)?;
+        let celestia_height = self.submit_blobs_with_retry(&blobs).await?;
+        Ok(Self::build_submissions(blobs, block_infos, celestia_height))
+    }
 
-        // Create blobs for all blocks
+    /// Create blobs for a batch of blocks.
+    fn create_blobs_for_blocks(&self, blocks: &[Block]) -> Result<(Vec<Blob>, Vec<BlockInfo>)> {
         let mut blobs = Vec::with_capacity(blocks.len());
-        let mut block_infos: Vec<(B256, u64)> = Vec::with_capacity(blocks.len());
+        let mut infos = Vec::with_capacity(blocks.len());
 
         for block in blocks {
-            let blob_data = Self::encode_block(block)?;
-            let blob =
-                Blob::new(self.namespace, blob_data, Some(address), AppVersion::latest())
-                    .map_err(|e| CelestiaError::EncodeFailed(format!("failed to create blob: {e}")))?;
+            let blob = self.create_blob_for_block(block)?;
+            infos.push(BlockInfo { hash: block.block_hash, height: block.height() });
             blobs.push(blob);
-            block_infos.push((block.block_hash, block.height()));
         }
+        Ok((blobs, infos))
+    }
 
-        // Submit all blobs in one transaction with retry
+    /// Create a single blob for a block.
+    fn create_blob_for_block(&self, block: &Block) -> Result<Blob> {
+        let address = self.lumina_client.address()
+            .map_err(|e| CelestiaError::Internal(format!("failed to get address: {e}")))?;
+        let data = Self::encode_block(block)?;
+        Blob::new(self.namespace, data, Some(address), AppVersion::latest())
+            .map_err(|e| CelestiaError::EncodeFailed(format!("failed to create blob: {e}")))
+    }
+
+    /// Submit blobs with retry logic.
+    async fn submit_blobs_with_retry(&self, blobs: &[Blob]) -> Result<u64> {
         let gas_price = self.config.gas_price;
         let client = &self.lumina_client;
         let block_count = blobs.len();
 
-        let celestia_height = with_retry(
-            "Batch submission",
-            DEFAULT_MAX_RETRIES,
-            DEFAULT_RETRY_DELAY_MS,
-            || async {
-                let tx_config = TxConfig::default().with_gas_price(gas_price);
-                let tx_info = client.blob().submit(&blobs, tx_config).await?;
+        with_retry("Batch submission", DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_MS, || async {
+            let tx_config = TxConfig::default().with_gas_price(gas_price);
+            let tx_info = client.blob().submit(blobs, tx_config).await?;
+            tracing::info!(height = tx_info.height, tx_hash = %hex::encode(tx_info.hash), block_count, "Batch submitted");
+            Ok::<_, celestia_client::Error>(tx_info.height)
+        }).await
+    }
 
-                tracing::info!(
-                    height = tx_info.height,
-                    tx_hash = %hex::encode(tx_info.hash),
-                    block_count,
-                    "Block batch submitted to Celestia"
-                );
-
-                Ok::<_, celestia_client::Error>(tx_info.height)
-            },
-        )
-        .await?;
-
-        // Build submission results
-        let submissions: Vec<BlobSubmission> = block_infos
-            .into_iter()
-            .zip(blobs.iter())
-            .map(|((block_hash, block_height), blob)| BlobSubmission {
-                block_hash,
-                block_height,
-                celestia_height,
-                commitment: Self::commitment_to_bytes(blob.commitment.into()),
-            })
-            .collect();
-
-        Ok(submissions)
+    /// Build submission results from blobs and block infos.
+    fn build_submissions(blobs: Vec<Blob>, infos: Vec<BlockInfo>, celestia_height: u64) -> Vec<BlobSubmission> {
+        infos.into_iter().zip(blobs).map(|(info, blob)| BlobSubmission {
+            block_hash: info.hash,
+            block_height: info.height,
+            celestia_height,
+            commitment: Self::commitment_to_bytes(blob.commitment.into()),
+        }).collect()
     }
 }
 
@@ -633,7 +567,7 @@ impl DataAvailability for CelestiaClient {
         let tracker = self.finality_tracker.clone();
 
         tokio::spawn(async move {
-            tracker.write().await.track(submission);
+            tracker.write().await.track(&submission);
         });
     }
 }

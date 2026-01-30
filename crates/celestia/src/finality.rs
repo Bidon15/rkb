@@ -68,7 +68,7 @@ impl FinalityTracker {
     }
 
     /// Track a new submission for finality.
-    pub fn track(&mut self, submission: BlobSubmission) {
+    pub fn track(&mut self, submission: &BlobSubmission) {
         let pending = PendingFinality {
             block_height: submission.block_height,
             celestia_height: submission.celestia_height,
@@ -89,31 +89,34 @@ impl FinalityTracker {
         self.celestia_finalized_height = celestia_height;
         let now = Instant::now();
 
-        // Find all blocks whose Celestia height is now finalized
-        let finalized: Vec<_> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.celestia_height <= celestia_height)
-            .map(|(hash, p)| FinalityConfirmation {
-                block_hash: *hash,
-                block_height: p.block_height,
-                celestia_height: p.celestia_height,
-                celestia_header_hash,
-                submitted_at: p.submitted_at,
-                confirmed_at: now,
-            })
-            .collect();
+        let mut confirmations = Vec::new();
+        self.pending.retain(|hash, pending| {
+            if pending.celestia_height > celestia_height {
+                return true; // keep
+            }
+            confirmations.push(Self::build_confirmation(*hash, pending, celestia_header_hash, now));
+            false // remove
+        });
 
-        // Remove from pending
-        for confirmation in &finalized {
-            self.pending.remove(&confirmation.block_hash);
+        confirmations.sort_by_key(|c| c.block_height);
+        confirmations
+    }
+
+    /// Build a finality confirmation from pending data.
+    fn build_confirmation(
+        block_hash: B256,
+        pending: &PendingFinality,
+        celestia_header_hash: B256,
+        now: Instant,
+    ) -> FinalityConfirmation {
+        FinalityConfirmation {
+            block_hash,
+            block_height: pending.block_height,
+            celestia_height: pending.celestia_height,
+            celestia_header_hash,
+            submitted_at: pending.submitted_at,
+            confirmed_at: now,
         }
-
-        // Sort by block height (ascending)
-        let mut sorted = finalized;
-        sorted.sort_by_key(|c| c.block_height);
-
-        sorted
     }
 
     /// Number of blocks awaiting finality.
@@ -144,7 +147,7 @@ mod tests {
             commitment: vec![1, 2, 3],
         };
 
-        tracker.track(submission);
+        tracker.track(&submission);
         assert_eq!(tracker.pending_count(), 1);
 
         // Finalize at height 99 - shouldn't finalize our block

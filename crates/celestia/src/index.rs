@@ -103,37 +103,40 @@ impl BlockIndex {
 
     /// Replay the index file to rebuild in-memory state.
     async fn replay(&mut self) -> Result<()> {
-        let file = File::open(&self.path).await.map_err(|e| {
-            CelestiaError::Internal(format!("failed to open index for replay: {e}"))
-        })?;
+        let file = File::open(&self.path).await
+            .map_err(|e| CelestiaError::Internal(format!("failed to open index for replay: {e}")))?;
 
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut count = 0;
-        let mut errors = 0;
+        let mut lines = BufReader::new(file).lines();
+        let (mut count, mut errors) = (0u64, 0u64);
 
-        while let Some(line) = lines.next_line().await.map_err(|e| {
-            CelestiaError::Internal(format!("failed to read index line: {e}"))
-        })? {
-            if line.is_empty() {
-                continue;
-            }
-
-            match serde_json::from_str::<IndexEntry>(&line) {
-                Ok(entry) => {
-                    self.by_hash.insert(entry.block_hash, entry.block_height);
-                    self.by_height.insert(entry.block_height, entry);
-                    count += 1;
-                }
-                Err(e) => {
-                    warn!(error = %e, line = %line, "Skipping malformed index entry");
-                    errors += 1;
-                }
-            }
+        while let Some(line) = Self::next_line(&mut lines).await? {
+            if line.is_empty() { continue; }
+            if self.parse_and_insert(&line) { count += 1; } else { errors += 1; }
         }
 
         debug!(entries = count, errors, "Index replay complete");
         Ok(())
+    }
+
+    /// Read the next line from the index file.
+    async fn next_line(lines: &mut tokio::io::Lines<BufReader<File>>) -> Result<Option<String>> {
+        lines.next_line().await
+            .map_err(|e| CelestiaError::Internal(format!("failed to read index line: {e}")))
+    }
+
+    /// Parse a line and insert into the index. Returns true on success.
+    fn parse_and_insert(&mut self, line: &str) -> bool {
+        match serde_json::from_str::<IndexEntry>(line) {
+            Ok(entry) => {
+                self.by_hash.insert(entry.block_hash, entry.block_height);
+                self.by_height.insert(entry.block_height, entry);
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, line = %line, "Skipping malformed index entry");
+                false
+            }
+        }
     }
 
     /// Insert a new entry into the index.
