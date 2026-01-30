@@ -147,27 +147,7 @@ impl SimplexSequencer {
         let genesis_hash = components.forkchoice.read().await.head;
         let runtime_config = build_runtime_config(&self.config.consensus, genesis_hash)?;
 
-        // Sync from Celestia DA if configured
-        let genesis_da_height = self.config.celestia.genesis_da_height;
-        if genesis_da_height > 0 {
-            let mut block_index = BlockIndex::open(&self.config.celestia.index_path)
-                .await
-                .wrap_err("failed to open block index")?;
-
-            info!(genesis_da_height, "Syncing historical blocks from Celestia DA");
-            let synced_height = Self::sync_from_celestia(
-                &components.celestia,
-                &components.execution,
-                &components.forkchoice,
-                &components.executed_blocks,
-                &mut block_index,
-                genesis_da_height,
-            )
-            .await
-            .wrap_err("failed to sync from Celestia")?;
-
-            info!(synced_height, "Celestia sync complete, starting consensus");
-        }
+        self.init_from_celestia(&components).await?;
 
         info!(
             validators = runtime_config.validators.len(),
@@ -231,6 +211,36 @@ impl SimplexSequencer {
         info!("Celestia finality tracker started");
 
         Ok((celestia, finality_rx))
+    }
+
+    /// Initialize state from Celestia if genesis_da_height is configured.
+    ///
+    /// Replays historical blocks to catch up with the network.
+    async fn init_from_celestia(&self, components: &SequencerComponents) -> Result<()> {
+        let genesis_da_height = self.config.celestia.genesis_da_height;
+        if genesis_da_height == 0 {
+            return Ok(());
+        }
+
+        let mut block_index = BlockIndex::open(&self.config.celestia.index_path)
+            .await
+            .wrap_err("failed to open block index")?;
+
+        info!(genesis_da_height, "Syncing historical blocks from Celestia DA");
+
+        let synced_height = Self::sync_from_celestia(
+            &components.celestia,
+            &components.execution,
+            &components.forkchoice,
+            &components.executed_blocks,
+            &mut block_index,
+            genesis_da_height,
+        )
+        .await
+        .wrap_err("failed to sync from Celestia")?;
+
+        info!(synced_height, "Celestia sync complete, starting consensus");
+        Ok(())
     }
 
     /// Initialize the execution client.
