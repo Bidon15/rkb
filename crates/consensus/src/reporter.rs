@@ -39,42 +39,28 @@ impl Reporter for ConsensusReporter {
         if self.verbose {
             tracing::trace!(?activity, "Consensus activity");
         }
+        self.handle_activity(&activity);
+    }
+}
 
-        // Track activity for monitoring
-        match &activity {
-            Activity::Notarize(vote) => {
-                tracing::debug!(round = ?vote.round(), "Notarize vote");
+impl ConsensusReporter {
+    /// Handle consensus activity - log and forward finalization events.
+    fn handle_activity(&mut self, activity: &Activity<Scheme, AppDigest>) {
+        use Activity::*;
+        match activity {
+            Notarize(v) => tracing::debug!(round = ?v.round(), "Notarize vote"),
+            Notarization(c) => tracing::debug!(view = ?c.view(), "Block notarized"),
+            Certification(c) => tracing::debug!(view = ?c.view(), "Block certified"),
+            Nullify(v) => tracing::debug!(round = ?v.round(), "Nullify vote"),
+            Nullification(c) => tracing::debug!(view = ?c.view(), "View nullified"),
+            Finalize(v) => tracing::debug!(round = ?v.round(), "Finalize vote"),
+            Finalization(c) => {
+                tracing::info!(view = ?c.view(), "Block finalized by consensus");
+                self.mailbox.finalize(c.proposal.payload);
             }
-            Activity::Notarization(cert) => {
-                tracing::debug!(view = ?cert.view(), "Block notarized");
-            }
-            Activity::Certification(cert) => {
-                tracing::debug!(view = ?cert.view(), "Block certified");
-            }
-            Activity::Nullify(vote) => {
-                tracing::debug!(round = ?vote.round(), "Nullify vote");
-            }
-            Activity::Nullification(cert) => {
-                tracing::debug!(view = ?cert.view(), "View nullified");
-            }
-            Activity::Finalize(vote) => {
-                tracing::debug!(round = ?vote.round(), "Finalize vote");
-            }
-            Activity::Finalization(cert) => {
-                tracing::info!(view = ?cert.view(), "Block finalized by consensus");
-                // Forward finalization to application actor to retrieve and broadcast the block
-                let digest = cert.proposal.payload;
-                self.mailbox.finalize(digest);
-            }
-            Activity::ConflictingNotarize(evidence) => {
-                tracing::warn!(signer = ?evidence.signer(), "Conflicting notarize detected (equivocation)");
-            }
-            Activity::ConflictingFinalize(evidence) => {
-                tracing::warn!(signer = ?evidence.signer(), "Conflicting finalize detected (equivocation)");
-            }
-            Activity::NullifyFinalize(evidence) => {
-                tracing::warn!(signer = ?evidence.signer(), "Nullify+Finalize detected (equivocation)");
-            }
+            ConflictingNotarize(e) => tracing::warn!(signer = ?e.signer(), "Conflicting notarize"),
+            ConflictingFinalize(e) => tracing::warn!(signer = ?e.signer(), "Conflicting finalize"),
+            NullifyFinalize(e) => tracing::warn!(signer = ?e.signer(), "Nullify+Finalize"),
         }
     }
 }

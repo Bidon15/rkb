@@ -208,6 +208,23 @@ enum SyncResult {
     Failed,
 }
 
+/// Result of querying reth head state.
+struct RethHead {
+    hash: B256,
+    number: u64,
+    timestamp: u64,
+}
+
+/// Sync check outcome.
+enum SyncCheck {
+    /// States match, proceed with building.
+    Synced,
+    /// Reth behind consensus, should retry.
+    Behind,
+    /// State divergence, abort.
+    Diverged,
+}
+
 /// Application state for block production.
 ///
 /// This coordinates block building with reth via the ExecutionClient
@@ -310,72 +327,66 @@ impl Application {
     ];
 
     /// Wait for reth's head to match our expected parent.
-    ///
-    /// This prevents race conditions where consensus runs ahead of execution.
     async fn wait_for_reth_sync(&self) -> SyncResult {
-        const MAX_SYNC_ATTEMPTS: u32 = 10;
-        const SYNC_DELAY_MS: u64 = 100;
+        const MAX_ATTEMPTS: u32 = 10;
+        const DELAY_MS: u64 = 100;
 
-        let expected_parent_height = self.height.saturating_sub(1);
-
-        for sync_attempt in 1..=MAX_SYNC_ATTEMPTS {
-            let (reth_head_hash, reth_head_number, reth_head_timestamp) =
-                match self.execution.get_head().await {
-                    Ok(head) => head,
-                    Err(e) => {
-                        tracing::warn!(?e, "Failed to query reth head, retrying...");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(SYNC_DELAY_MS)).await;
-                        continue;
-                    }
-                };
-
-            if reth_head_hash == self.last_hash {
-                tracing::debug!(
-                    reth_head = %reth_head_hash,
-                    reth_height = reth_head_number,
-                    parent_timestamp = reth_head_timestamp,
-                    our_parent = %self.last_hash,
-                    "State synchronized, proceeding with block building"
-                );
-                return SyncResult::Synced { parent_timestamp: reth_head_timestamp };
-            }
-
-            if reth_head_number < expected_parent_height {
-                tracing::info!(
-                    reth_head = %reth_head_hash,
-                    reth_height = reth_head_number,
-                    our_parent = %self.last_hash,
-                    expected_height = expected_parent_height,
-                    sync_attempt,
-                    "SYNC WAIT: reth behind consensus, waiting for finalization to apply"
-                );
-                tokio::time::sleep(tokio::time::Duration::from_millis(SYNC_DELAY_MS)).await;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let Some(head) = self.query_reth_head().await else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MS)).await;
                 continue;
-            }
+            };
 
-            // State divergence - reth ahead or different hash at same height
-            if reth_head_number > expected_parent_height {
-                tracing::error!(
-                    reth_head = %reth_head_hash,
-                    reth_height = reth_head_number,
-                    our_parent = %self.last_hash,
-                    expected_height = expected_parent_height,
-                    "STATE DIVERGENCE: reth ahead of consensus! This is a bug."
-                );
-            } else {
-                tracing::error!(
-                    reth_head = %reth_head_hash,
-                    reth_height = reth_head_number,
-                    our_parent = %self.last_hash,
-                    expected_height = expected_parent_height,
-                    "STATE DIVERGENCE: same height but different hash! Chain fork?"
-                );
+            match self.check_sync_state(&head, attempt) {
+                SyncCheck::Synced => return SyncResult::Synced { parent_timestamp: head.timestamp },
+                SyncCheck::Behind => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MS)).await;
+                    continue;
+                }
+                SyncCheck::Diverged => return SyncResult::Failed,
             }
-            return SyncResult::Failed;
         }
 
-        tracing::error!("Sync timeout after {} attempts", MAX_SYNC_ATTEMPTS);
+        tracing::error!(max_attempts = MAX_ATTEMPTS, "Sync timeout");
         SyncResult::Failed
+    }
+
+    /// Query reth head state, returns None on error.
+    async fn query_reth_head(&self) -> Option<RethHead> {
+        match self.execution.get_head().await {
+            Ok((hash, number, timestamp)) => Some(RethHead { hash, number, timestamp }),
+            Err(e) => {
+                tracing::warn!(?e, "Failed to query reth head, retrying...");
+                None
+            }
+        }
+    }
+
+    /// Check if reth state matches our expected parent.
+    fn check_sync_state(&self, head: &RethHead, attempt: u32) -> SyncCheck {
+        let expected_height = self.height.saturating_sub(1);
+
+        if head.hash == self.last_hash {
+            tracing::debug!(reth_head = %head.hash, reth_height = head.number, "State synchronized");
+            return SyncCheck::Synced;
+        }
+
+        if head.number < expected_height {
+            tracing::info!(reth_height = head.number, expected_height, attempt, "SYNC WAIT: reth behind consensus");
+            return SyncCheck::Behind;
+        }
+
+        self.log_divergence(head, expected_height);
+        SyncCheck::Diverged
+    }
+
+    /// Log state divergence error.
+    fn log_divergence(&self, head: &RethHead, expected_height: u64) {
+        if head.number > expected_height {
+            tracing::error!(reth_height = head.number, expected_height, "STATE DIVERGENCE: reth ahead of consensus");
+        } else {
+            tracing::error!(reth_hash = %head.hash, our_hash = %self.last_hash, "STATE DIVERGENCE: different hash at same height");
+        }
     }
 
     /// Get current wall clock timestamp in seconds.
@@ -403,90 +414,69 @@ impl Application {
         }
     }
 
-    /// Propose a new block using the vanilla Ethereum builder flow.
-    ///
-    /// Returns null proposal if:
-    /// - We've already proposed at this height (prevents duplicate blocks)
-    /// - Reth is not synced with our expected parent
-    /// - Block building fails
-    async fn propose(&mut self, context: AppContext) -> AppDigest {
-        // CRITICAL: Prevent duplicate proposals at the same height.
-        // When Simplex advances views quickly, propose() can be called multiple times
-        // before the previous block is finalized. We must return null proposal to
-        // avoid creating duplicate blocks at the same height.
-        if let Some(last_proposed) = self.last_proposed_height {
-            if last_proposed >= self.height {
-                tracing::warn!(
-                    current_height = self.height,
-                    last_proposed_height = last_proposed,
-                    ?context.round,
-                    "Skipping proposal - already proposed at this height, waiting for finalization"
-                );
-                return commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST);
-            }
-        }
-
-        tracing::debug!(
-            height = self.height,
-            ?context.round,
-            parent_hash = %self.last_hash,
-            "Starting block building via reth"
-        );
-
-        // Wait for reth to sync
-        let parent_timestamp = match self.wait_for_reth_sync().await {
-            SyncResult::Synced { parent_timestamp } => parent_timestamp,
-            SyncResult::Failed => {
-                return commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST);
-            }
-        };
-
-        // Check if we can build based on timing mode
-        if !Self::can_build_block(self.block_timing, parent_timestamp) {
-            tracing::debug!(
-                height = self.height,
-                parent_timestamp,
-                block_timing = ?self.block_timing,
-                "Skipping proposal - waiting for timestamp to advance"
-            );
-            return commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST);
-        }
-
-        // Use actual wall clock - no artificial timestamp adjustment
-        let timestamp = Self::wall_clock_timestamp();
-
-        // Build block via reth
-        match self.execution.start_building(self.last_hash, timestamp, self.proposer).await {
-            Ok(payload_id) => {
-                match self.execution.get_payload(payload_id).await {
-                    Ok(payload) => return self.complete_proposal(context, payload).await,
-                    Err(e) => tracing::error!(?e, "Failed to get built payload"),
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    ?e,
-                    height = self.height,
-                    parent_hash = %self.last_hash,
-                    "Block building failed after sync verification - unexpected"
-                );
-            }
-        }
-
-        tracing::error!(
-            height = self.height,
-            ?context.round,
-            parent_hash = %self.last_hash,
-            "Failed to build block despite sync verification, returning null proposal"
-        );
-
+    /// Return null proposal digest.
+    fn null_proposal() -> AppDigest {
         commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST)
     }
 
-    /// Complete a successful proposal by building the block and storing it.
-    async fn complete_proposal(&mut self, context: AppContext, payload: BuiltPayload) -> AppDigest {
+    /// Check if we've already proposed at this height.
+    fn already_proposed_at_height(&self, context: &AppContext) -> bool {
+        let Some(last) = self.last_proposed_height else { return false };
+        if last < self.height { return false; }
 
-        // Convert BuiltPayload to our Block type with all required fields
+        tracing::warn!(height = self.height, last_proposed = last, ?context.round, "Skipping - already proposed");
+        true
+    }
+
+    /// Build a block via reth, returns payload on success.
+    async fn build_via_reth(&self, timestamp: u64) -> Option<BuiltPayload> {
+        let payload_id = match self.execution.start_building(self.last_hash, timestamp, self.proposer).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(?e, height = self.height, "Block building failed");
+                return None;
+            }
+        };
+
+        match self.execution.get_payload(payload_id).await {
+            Ok(payload) => Some(payload),
+            Err(e) => {
+                tracing::error!(?e, "Failed to get built payload");
+                None
+            }
+        }
+    }
+
+    /// Propose a new block using the vanilla Ethereum builder flow.
+    async fn propose(&mut self, context: AppContext) -> AppDigest {
+        if self.already_proposed_at_height(&context) {
+            return Self::null_proposal();
+        }
+
+        tracing::debug!(height = self.height, ?context.round, parent_hash = %self.last_hash, "Starting block building");
+
+        let parent_timestamp = match self.wait_for_reth_sync().await {
+            SyncResult::Synced { parent_timestamp } => parent_timestamp,
+            SyncResult::Failed => return Self::null_proposal(),
+        };
+
+        if !Self::can_build_block(self.block_timing, parent_timestamp) {
+            tracing::debug!(height = self.height, parent_timestamp, "Waiting for timestamp to advance");
+            return Self::null_proposal();
+        }
+
+        let timestamp = Self::wall_clock_timestamp();
+        match self.build_via_reth(timestamp).await {
+            Some(payload) => self.complete_proposal(context, payload).await,
+            None => {
+                tracing::error!(height = self.height, ?context.round, "Build failed, returning null proposal");
+                Self::null_proposal()
+            }
+        }
+    }
+
+    /// Convert a BuiltPayload to our Block type.
+    fn build_block_from_payload(payload: &BuiltPayload) -> Block {
         let header = BlockHeader {
             height: payload.block_number,
             timestamp: payload.timestamp,
@@ -494,13 +484,9 @@ impl Application {
             proposer: payload.fee_recipient,
         };
 
-        let transactions: Vec<Transaction> = payload
-            .transactions
-            .iter()
-            .map(|tx| Transaction::new(tx.to_vec()))
-            .collect();
+        let transactions: Vec<Transaction> = payload.transactions.iter().map(|tx| Transaction::new(tx.to_vec())).collect();
 
-        let block = Block::new(BlockParams {
+        Block::new(BlockParams {
             header,
             transactions,
             state_root: payload.state_root,
@@ -512,42 +498,38 @@ impl Application {
             gas_limit: payload.gas_limit,
             base_fee_per_gas: payload.base_fee_per_gas,
             block_hash: payload.block_hash,
-        });
+        })
+    }
 
-        // Compute digest from reth's block hash
-        self.hasher.update(block.block_hash.as_slice());
-        let digest = self.hasher.finalize();
+    /// Compute digest from block hash.
+    fn compute_digest(&mut self, block_hash: B256) -> AppDigest {
+        self.hasher.update(block_hash.as_slice());
+        self.hasher.finalize()
+    }
 
-        // Save values for logging before moving
-        let block_hash = block.block_hash;
-        let tx_count = block.tx_count();
-
-        // Broadcast to relay so other validators can receive it
-        let proposed = ProposedBlock {
-            digest,
-            block: block.clone(),
-            payload: payload.clone(),
-        };
+    /// Broadcast proposed block to relay.
+    fn broadcast_to_relay(&self, digest: AppDigest, block: &Block, payload: &BuiltPayload) {
+        let proposed = ProposedBlock { digest, block: block.clone(), payload: payload.clone() };
         if self.block_relay_sender.send(proposed).is_err() {
             tracing::debug!("No block relay subscribers");
         }
+    }
 
-        // Store pending block and payload
+    /// Complete a successful proposal by building the block and storing it.
+    async fn complete_proposal(&mut self, context: AppContext, payload: BuiltPayload) -> AppDigest {
+        let block = Self::build_block_from_payload(&payload);
+        let digest = self.compute_digest(block.block_hash);
+
+        let block_hash = block.block_hash;
+        let tx_count = block.tx_count();
+
+        self.broadcast_to_relay(digest, &block, &payload);
         self.pending_blocks.insert(digest, block);
         self.pending_payloads.insert(digest, payload);
         self.verified.insert(digest);
-
-        // Mark that we've proposed at this height to prevent duplicates
         self.last_proposed_height = Some(self.height);
 
-        tracing::info!(
-            height = self.height,
-            ?context.round,
-            %block_hash,
-            tx_count,
-            "Proposed block via reth builder"
-        );
-
+        tracing::info!(height = self.height, ?context.round, %block_hash, tx_count, "Proposed block");
         digest
     }
 
@@ -577,95 +559,72 @@ impl Application {
         // The actual block content is propagated via the block relay channel
     }
 
-    /// Finalize a block and update state.
-    ///
-    /// This applies the block to reth via newPayloadV3 and updates forkchoice.
-    ///
-    /// CRITICAL: Only accepts blocks at the expected height. This prevents
-    /// finalizing duplicate blocks when Simplex views advance faster than
-    /// finalization callbacks are processed.
-    pub async fn finalize(&mut self, digest: AppDigest) -> Option<Block> {
-        if let Some(block) = self.pending_blocks.remove(&digest) {
-            // CRITICAL: Verify block is at expected height to prevent duplicate finalizations.
-            // When Simplex advances views quickly, multiple blocks can be proposed at the
-            // same height before the first one is finalized. We must reject stale blocks.
-            //
-            // NOTE: In vanilla timing mode, this is EXPECTED behavior - multiple validators
-            // may propose blocks at the same height when the timestamp constraint first allows.
-            // Consensus finalizes one, the rest are correctly rejected here.
-            if block.height() != self.height {
-                tracing::debug!(
-                    expected_height = self.height,
-                    block_height = block.height(),
-                    block_hash = %block.block_hash,
-                    ?digest,
-                    "Ignoring stale block finalization - already finalized a block at this height"
-                );
-                // Clean up the orphaned payload
-                self.pending_payloads.remove(&digest);
-                return None;
-            }
-
-            // Get the payload - we need it to apply to reth
-            let payload = self.pending_payloads.remove(&digest);
-
-            // Apply the payload to reth so it updates its chain
-            if let Some(ref payload) = payload {
-                if let Err(e) = self.execution.apply_built_payload(payload).await {
-                    tracing::error!(?e, "Failed to apply built payload to reth");
-                    // Still finalize locally - consensus agreed on this block
-                }
-            } else {
-                tracing::warn!("No payload found for finalized block, reth may be out of sync");
-            }
-
-            self.height = block.height() + 1;
-            self.last_hash = block.block_hash;
-
-            // Clean up any stale pending blocks at heights we've already finalized.
-            // This prevents memory leaks from accumulated duplicate proposals.
-            let stale_digests: Vec<_> = self
-                .pending_blocks
-                .iter()
-                .filter(|(_, b)| b.height() < self.height)
-                .map(|(d, _)| *d)
-                .collect();
-
-            if !stale_digests.is_empty() {
-                tracing::debug!(
-                    count = stale_digests.len(),
-                    new_height = self.height,
-                    "Cleaning up stale pending blocks"
-                );
-                for digest in stale_digests {
-                    self.pending_blocks.remove(&digest);
-                    self.pending_payloads.remove(&digest);
-                }
-            }
-
-            // Broadcast finalized block to subscribers
-            if self.block_sender.send(block.clone()).is_err() {
-                tracing::debug!("No block subscribers");
-            }
-
-            tracing::info!(
-                height = block.height(),
-                block_hash = %block.block_hash,
-                tx_count = block.tx_count(),
-                "Block finalized"
-            );
-
-            Some(block)
-        } else {
-            // Clean up orphaned payload if exists
-            self.pending_payloads.remove(&digest);
-            // NOTE: In vanilla timing mode, this can happen when multiple blocks are proposed
-            // at the same height. The first finalized block triggers cleanup of pending blocks
-            // at that height. Subsequent finalization attempts for those cleaned-up blocks
-            // arrive here. This is expected behavior, not an error.
-            tracing::debug!(?digest, "Ignoring finalization for already-cleaned-up block");
-            None
+    /// Apply payload to reth execution client.
+    async fn apply_to_reth(&self, payload: Option<&BuiltPayload>) {
+        let Some(payload) = payload else {
+            tracing::warn!("No payload found for finalized block");
+            return;
+        };
+        if let Err(e) = self.execution.apply_built_payload(payload).await {
+            tracing::error!(?e, "Failed to apply payload to reth");
         }
+    }
+
+    /// Clean up stale pending blocks below current height.
+    fn cleanup_stale_blocks(&mut self) {
+        let stale: Vec<_> = self.pending_blocks.iter()
+            .filter(|(_, b)| b.height() < self.height)
+            .map(|(d, _)| *d)
+            .collect();
+
+        if stale.is_empty() { return; }
+
+        tracing::debug!(count = stale.len(), height = self.height, "Cleaning up stale blocks");
+        for digest in stale {
+            self.pending_blocks.remove(&digest);
+            self.pending_payloads.remove(&digest);
+        }
+    }
+
+    /// Broadcast finalized block to subscribers.
+    fn broadcast_finalized(&self, block: &Block) {
+        if self.block_sender.send(block.clone()).is_err() {
+            tracing::debug!("No block subscribers");
+        }
+    }
+
+    /// Check if block height matches expected height.
+    fn is_valid_height(&self, block: &Block, digest: AppDigest) -> bool {
+        if block.height() == self.height { return true; }
+
+        tracing::debug!(expected = self.height, actual = block.height(), ?digest, "Ignoring stale finalization");
+        false
+    }
+
+    /// Finalize a block and update state.
+    pub async fn finalize(&mut self, digest: AppDigest) -> Option<Block> {
+        let Some(block) = self.pending_blocks.remove(&digest) else {
+            self.pending_payloads.remove(&digest);
+            tracing::debug!(?digest, "Ignoring finalization for unknown block");
+            return None;
+        };
+
+        if !self.is_valid_height(&block, digest) {
+            self.pending_payloads.remove(&digest);
+            return None;
+        }
+
+        let payload = self.pending_payloads.remove(&digest);
+        self.apply_to_reth(payload.as_ref()).await;
+
+        self.height = block.height() + 1;
+        self.last_hash = block.block_hash;
+
+        self.cleanup_stale_blocks();
+        self.broadcast_finalized(&block);
+
+        tracing::info!(height = block.height(), block_hash = %block.block_hash, tx_count = block.tx_count(), "Block finalized");
+        Some(block)
     }
 
     /// Handle a block received from another validator via relay.
@@ -701,48 +660,44 @@ impl Application {
         self.verified.insert(digest);
     }
 
+    /// Handle genesis message.
+    fn handle_genesis(&mut self, epoch: Epoch, response: oneshot::Sender<AppDigest>) {
+        let digest = self.genesis(epoch);
+        let _ = response.send(digest);
+    }
+
+    /// Handle propose message.
+    async fn handle_propose(&mut self, context: AppContext, response: oneshot::Sender<AppDigest>) {
+        let digest = self.propose(context).await;
+        let _ = response.send(digest);
+    }
+
+    /// Handle verify message.
+    fn handle_verify(&mut self, context: AppContext, payload: AppDigest, response: oneshot::Sender<bool>) {
+        let valid = self.verify(context, payload);
+        let _ = response.send(valid);
+    }
+
+    /// Process a single message.
+    async fn process_message(&mut self, message: Message) {
+        match message {
+            Message::Genesis { epoch, response } => self.handle_genesis(epoch, response),
+            Message::Propose { context, response } => self.handle_propose(context, response).await,
+            Message::Verify { context, payload, response } => self.handle_verify(context, payload, response),
+            Message::Broadcast { payload } => self.broadcast(payload),
+            Message::Finalize { digest } => { self.finalize(digest).await; }
+            Message::ReceiveBlock { digest, block, payload } => self.handle_receive_block(digest, block, payload).await,
+        }
+    }
+
     /// Run the application actor loop.
     pub async fn run(mut self) {
         use futures::StreamExt;
 
         tracing::info!("Application actor started");
-
         while let Some(message) = self.mailbox.next().await {
-            match message {
-                Message::Genesis { epoch, response } => {
-                    let digest = self.genesis(epoch);
-                    if response.send(digest).is_err() {
-                        tracing::warn!("Genesis response receiver dropped");
-                    }
-                }
-                Message::Propose { context, response } => {
-                    let digest = self.propose(context).await;
-                    if response.send(digest).is_err() {
-                        tracing::warn!("Propose response receiver dropped");
-                    }
-                }
-                Message::Verify {
-                    context,
-                    payload,
-                    response,
-                } => {
-                    let valid = self.verify(context, payload);
-                    if response.send(valid).is_err() {
-                        tracing::warn!("Verify response receiver dropped");
-                    }
-                }
-                Message::Broadcast { payload } => {
-                    self.broadcast(payload);
-                }
-                Message::Finalize { digest } => {
-                    self.finalize(digest).await;
-                }
-                Message::ReceiveBlock { digest, block, payload } => {
-                    self.handle_receive_block(digest, block, payload).await;
-                }
-            }
+            self.process_message(message).await;
         }
-
         tracing::info!("Application actor stopped");
     }
 }
