@@ -39,6 +39,14 @@ struct SequencerComponents {
     finality_rx: mpsc::Receiver<FinalityConfirmation>,
 }
 
+/// Context for syncing operations (reduces parameter passing).
+struct SyncContext<'a> {
+    execution: &'a ExecutionClient,
+    forkchoice: &'a RwLock<ForkchoiceState>,
+    executed_blocks: &'a RwLock<HashSet<B256>>,
+    index: &'a mut BlockIndex,
+}
+
 impl SimplexSequencer {
     /// Create a new Simplex sequencer.
     pub fn new(config: Config) -> Self {
@@ -228,10 +236,7 @@ impl SimplexSequencer {
     ///
     /// Returns the block hash to use as next parent.
     async fn sync_single_block(
-        execution: &ExecutionClient,
-        forkchoice: &RwLock<ForkchoiceState>,
-        executed_blocks: &RwLock<HashSet<B256>>,
-        index: &mut BlockIndex,
+        ctx: &mut SyncContext<'_>,
         block: Block,
         celestia_height: u64,
         expected_parent: B256,
@@ -239,16 +244,7 @@ impl SimplexSequencer {
         let block_height = block.height();
         let block_hash = block.block_hash;
 
-        // Verify parent hash chain (except for genesis)
-        if block_height > 1 && block.parent_hash() != expected_parent {
-            warn!(
-                block_height,
-                expected_parent = %expected_parent,
-                actual_parent = %block.parent_hash(),
-                "Parent hash mismatch, possible chain discontinuity"
-            );
-            // Continue anyway - might be out-of-order blocks in same Celestia height
-        }
+        check_parent_continuity(&block, expected_parent);
 
         info!(
             block_height,
@@ -257,42 +253,19 @@ impl SimplexSequencer {
             "Syncing block from Celestia"
         );
 
-        // Execute block on reth
-        let result = execution
-            .execute_block(&block)
-            .await
-            .wrap_err_with(|| format!("failed to execute block {block_height}"))?;
-
-        if !result.is_valid() {
-            eyre::bail!(
-                "block {} invalid during sync: {:?}",
-                block_height,
-                result.status
-            );
-        }
-
-        // Update forkchoice
-        let new_forkchoice = {
-            let current = forkchoice.read().await;
-            current.with_soft(block_hash)
-        };
-        execution
-            .update_forkchoice(new_forkchoice)
-            .await
-            .wrap_err_with(|| format!("failed to update forkchoice for block {block_height}"))?;
-        *forkchoice.write().await = new_forkchoice;
+        execute_sync_block(ctx.execution, ctx.forkchoice, &block, block_hash, block_height).await?;
 
         // Track as successfully executed
-        executed_blocks.write().await.insert(block_hash);
+        ctx.executed_blocks.write().await.insert(block_hash);
 
-        // Add to index (we don't have the commitment during sync, use empty)
+        // Add to index (commitment not available during sync)
         let entry = IndexEntry {
             block_height,
             block_hash,
             celestia_height,
-            commitment: vec![], // Commitment not available during sync
+            commitment: vec![],
         };
-        index
+        ctx.index
             .insert(entry)
             .await
             .wrap_err("failed to update block index")?;
@@ -314,68 +287,60 @@ impl SimplexSequencer {
         index: &mut BlockIndex,
         genesis_da_height: u64,
     ) -> Result<u64> {
-        let start_height = genesis_da_height;
         let current_celestia_height = celestia.finalized_height().await;
 
-        if current_celestia_height == 0 {
-            info!("No Celestia finality data yet, skipping sync");
-            return Ok(index.latest_height().unwrap_or(0));
-        }
-
-        if start_height > current_celestia_height {
-            info!(
-                start_height,
-                current_celestia_height,
-                "Already synced past current Celestia height"
-            );
-            return Ok(index.latest_height().unwrap_or(0));
+        if let Some(height) = check_sync_preconditions(index, genesis_da_height, current_celestia_height) {
+            return Ok(height);
         }
 
         info!(
             genesis_da_height,
-            start_height,
             current_celestia_height,
             "Syncing blocks from Celestia DA"
         );
 
-        // Fetch and sort blocks
-        let blocks = Self::fetch_blocks_from_celestia(celestia, start_height, current_celestia_height).await?;
+        let blocks = Self::fetch_blocks_from_celestia(celestia, genesis_da_height, current_celestia_height).await?;
 
         if blocks.is_empty() {
             info!("No blocks found in Celestia range");
             return Ok(index.latest_height().unwrap_or(0));
         }
 
-        // Sync each block
-        let mut parent_hash = forkchoice.read().await.head;
-        let mut last_synced_height = index.latest_height().unwrap_or(0);
+        let mut ctx = SyncContext {
+            execution,
+            forkchoice,
+            executed_blocks,
+            index,
+        };
+
+        let last_synced_height = Self::sync_block_batch(&mut ctx, blocks).await?;
+        info!(last_synced_height, "Celestia sync complete");
+
+        Ok(last_synced_height)
+    }
+
+    /// Sync a batch of blocks from Celestia.
+    async fn sync_block_batch(
+        ctx: &mut SyncContext<'_>,
+        blocks: Vec<(u64, Block)>,
+    ) -> Result<u64> {
+        let mut parent_hash = ctx.forkchoice.read().await.head;
+        let mut last_synced_height = ctx.index.latest_height().unwrap_or(0);
 
         for (celestia_height, block) in blocks {
             let block_height = block.height();
             let block_hash = block.block_hash;
 
             // Skip already-indexed blocks
-            if index.get_by_height(block_height).is_some() {
+            if ctx.index.get_by_height(block_height).is_some() {
                 info!(block_height, "Block already indexed, skipping");
                 parent_hash = block_hash;
                 continue;
             }
 
-            parent_hash = Self::sync_single_block(
-                execution,
-                forkchoice,
-                executed_blocks,
-                index,
-                block,
-                celestia_height,
-                parent_hash,
-            )
-            .await?;
-
+            parent_hash = Self::sync_single_block(ctx, block, celestia_height, parent_hash).await?;
             last_synced_height = block_height;
         }
-
-        info!(last_synced_height, "Celestia sync complete");
 
         Ok(last_synced_height)
     }
@@ -503,6 +468,80 @@ impl SimplexSequencer {
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Check sync preconditions. Returns Some(height) to skip sync, None to proceed.
+fn check_sync_preconditions(
+    index: &BlockIndex,
+    genesis_da_height: u64,
+    current_celestia_height: u64,
+) -> Option<u64> {
+    if current_celestia_height == 0 {
+        info!("No Celestia finality data yet, skipping sync");
+        return Some(index.latest_height().unwrap_or(0));
+    }
+
+    if genesis_da_height > current_celestia_height {
+        info!(
+            genesis_da_height,
+            current_celestia_height,
+            "Already synced past current Celestia height"
+        );
+        return Some(index.latest_height().unwrap_or(0));
+    }
+
+    None
+}
+
+/// Check parent hash continuity and log warnings.
+fn check_parent_continuity(block: &Block, expected_parent: B256) {
+    let block_height = block.height();
+
+    // Skip check for genesis block
+    if block_height <= 1 {
+        return;
+    }
+
+    if block.parent_hash() != expected_parent {
+        warn!(
+            block_height,
+            expected_parent = %expected_parent,
+            actual_parent = %block.parent_hash(),
+            "Parent hash mismatch, possible chain discontinuity"
+        );
+        // Continue anyway - might be out-of-order blocks in same Celestia height
+    }
+}
+
+/// Execute a block during sync and update forkchoice.
+async fn execute_sync_block(
+    execution: &ExecutionClient,
+    forkchoice: &RwLock<ForkchoiceState>,
+    block: &Block,
+    block_hash: B256,
+    block_height: u64,
+) -> Result<()> {
+    let result = execution
+        .execute_block(block)
+        .await
+        .wrap_err_with(|| format!("failed to execute block {block_height}"))?;
+
+    if !result.is_valid() {
+        eyre::bail!("block {} invalid during sync: {:?}", block_height, result.status);
+    }
+
+    let new_forkchoice = {
+        let current = forkchoice.read().await;
+        current.with_soft(block_hash)
+    };
+
+    execution
+        .update_forkchoice(new_forkchoice)
+        .await
+        .wrap_err_with(|| format!("failed to update forkchoice for block {block_height}"))?;
+
+    *forkchoice.write().await = new_forkchoice;
+    Ok(())
+}
 
 /// Result of handling a received block in the batch loop.
 enum BlockReceiveResult {
@@ -635,35 +674,43 @@ async fn submit_to_celestia(
     block_height: u64,
 ) {
     if batch_enabled {
-        if let Some(tx) = batch_tx {
-            if let Err(e) = tx.send(block).await {
-                error!(
-                    height = block_height,
-                    error = %e,
-                    "Failed to queue block for batch submission"
-                );
-            } else {
-                info!(height = block_height, "Block queued for batch submission");
-            }
-        }
+        queue_for_batch(batch_tx, block, block_height).await;
     } else {
-        // Submit immediately
-        match celestia.submit_block(&block).await {
-            Ok(submission) => {
-                info!(
-                    block_height,
-                    celestia_height = submission.celestia_height,
-                    "Block submitted to Celestia"
-                );
-                celestia.track_finality(block_hash, submission);
-            }
-            Err(e) => {
-                error!(
-                    block_height,
-                    error = %e,
-                    "Failed to submit block to Celestia"
-                );
-            }
+        submit_immediate(celestia, block, block_hash, block_height).await;
+    }
+}
+
+/// Queue a block for batch submission.
+async fn queue_for_batch(batch_tx: Option<&mpsc::Sender<Block>>, block: Block, block_height: u64) {
+    let Some(tx) = batch_tx else {
+        return;
+    };
+
+    if let Err(e) = tx.send(block).await {
+        error!(height = block_height, error = %e, "Failed to queue block for batch submission");
+    } else {
+        info!(height = block_height, "Block queued for batch submission");
+    }
+}
+
+/// Submit a single block immediately to Celestia.
+async fn submit_immediate(
+    celestia: &CelestiaClient,
+    block: Block,
+    block_hash: alloy_primitives::B256,
+    block_height: u64,
+) {
+    match celestia.submit_block(&block).await {
+        Ok(submission) => {
+            info!(
+                block_height,
+                celestia_height = submission.celestia_height,
+                "Block submitted to Celestia"
+            );
+            celestia.track_finality(block_hash, submission);
+        }
+        Err(e) => {
+            error!(block_height, error = %e, "Failed to submit block to Celestia");
         }
     }
 }
@@ -679,27 +726,55 @@ async fn handle_finality_confirmation(
     forkchoice: &RwLock<ForkchoiceState>,
     executed_blocks: &RwLock<HashSet<B256>>,
 ) {
+    log_finality_event(confirmation);
+
+    if !verify_block_executed(confirmation, executed_blocks).await {
+        return;
+    }
+
+    update_finalized_forkchoice(confirmation, execution, forkchoice).await;
+}
+
+/// Log the finality confirmation event.
+fn log_finality_event(confirmation: &FinalityConfirmation) {
     info!(
         block_height = confirmation.block_height,
         celestia_height = confirmation.celestia_height,
         latency_ms = confirmation.latency_ms(),
         "Block finalized on Celestia"
     );
+}
 
+/// Verify the block was successfully executed before updating finality.
+///
+/// Returns true if safe to proceed with finality update.
+async fn verify_block_executed(
+    confirmation: &FinalityConfirmation,
+    executed_blocks: &RwLock<HashSet<B256>>,
+) -> bool {
     // CRITICAL: Only update finalized pointer for blocks we've successfully executed.
     // If a block wasn't executed (e.g., execution failed, we're out of sync),
     // updating forkchoice would fail with "Invalid forkchoice state" (-38002)
     // because reth either doesn't know the block or it's not on the canonical chain.
-    if !executed_blocks.read().await.contains(&confirmation.block_hash) {
-        warn!(
-            block_height = confirmation.block_height,
-            block_hash = %confirmation.block_hash,
-            "Skipping finality confirmation - block not in executed set. \
-             This may indicate the block failed to execute or we're behind on sync."
-        );
-        return;
+    if executed_blocks.read().await.contains(&confirmation.block_hash) {
+        return true;
     }
 
+    warn!(
+        block_height = confirmation.block_height,
+        block_hash = %confirmation.block_hash,
+        "Skipping finality confirmation - block not in executed set. \
+         This may indicate the block failed to execute or we're behind on sync."
+    );
+    false
+}
+
+/// Update the forkchoice finalized pointer.
+async fn update_finalized_forkchoice(
+    confirmation: &FinalityConfirmation,
+    execution: &ExecutionClient,
+    forkchoice: &RwLock<ForkchoiceState>,
+) {
     let new_forkchoice = {
         let current = forkchoice.read().await;
         current.with_firm(confirmation.block_hash)
@@ -712,13 +787,14 @@ async fn handle_finality_confirmation(
             error = %e,
             "Failed to update finalized forkchoice - block may not be on canonical chain"
         );
-    } else {
-        *forkchoice.write().await = new_forkchoice;
-        info!(
-            finalized_height = confirmation.block_height,
-            "Forkchoice updated with Celestia finality"
-        );
+        return;
     }
+
+    *forkchoice.write().await = new_forkchoice;
+    info!(
+        finalized_height = confirmation.block_height,
+        "Forkchoice updated with Celestia finality"
+    );
 }
 
 /// Estimate the serialized size of a block.
