@@ -14,7 +14,7 @@ use commonware_consensus::{
 use commonware_cryptography::{ed25519::PublicKey, Hasher, Sha256};
 use futures::channel::{mpsc, oneshot};
 use sequencer_execution::{BlockBuilder, BuiltPayload, ExecutionClient};
-use sequencer_types::{Block, BlockHeader, BlockParams, Transaction};
+use sequencer_types::{Block, BlockHeader, BlockParams, BlockTiming, Transaction};
 use tokio::sync::broadcast;
 
 /// Digest type used by our application.
@@ -195,6 +195,9 @@ pub struct ApplicationConfig {
 
     /// Mailbox size for message buffering.
     pub mailbox_size: usize,
+
+    /// Block timing mode (vanilla = 1s blocks, subsecond = <1s with forked Reth).
+    pub block_timing: BlockTiming,
 }
 
 /// Result of waiting for reth to sync with consensus state.
@@ -249,6 +252,9 @@ pub struct Application {
     /// When Simplex requests a proposal at a height we've already proposed,
     /// we return null proposal to avoid creating duplicate blocks.
     last_proposed_height: Option<u64>,
+
+    /// Block timing mode.
+    block_timing: BlockTiming,
 }
 
 impl Application {
@@ -279,6 +285,7 @@ impl Application {
             last_hash: config.initial_hash,
             proposer: config.proposer,
             last_proposed_height: None,
+            block_timing: config.block_timing,
         };
 
         (app, Mailbox::new(sender), block_receiver, block_relay_receiver)
@@ -371,27 +378,29 @@ impl Application {
         SyncResult::Failed
     }
 
-    /// Compute block timestamp that's strictly greater than parent's.
+    /// Get current wall clock timestamp in seconds.
     ///
-    /// Ethereum requires: `block.timestamp > parent.timestamp`
-    fn compute_block_timestamp(parent_timestamp: u64) -> u64 {
-        let now = std::time::SystemTime::now()
+    /// Unlike the previous implementation, this returns the actual wall clock
+    /// without any artificial adjustment. The timing mode check in `can_build_block`
+    /// ensures we only call this when the timestamp will be valid.
+    fn wall_clock_timestamp() -> u64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
 
-        let timestamp = now.max(parent_timestamp + 1);
+    /// Check if we can build a block based on timing mode.
+    ///
+    /// - Vanilla: Only when wall clock > parent timestamp (enforces 1s minimum)
+    /// - Subsecond: When wall clock >= parent timestamp (allows same-second)
+    fn can_build_block(block_timing: BlockTiming, parent_timestamp: u64) -> bool {
+        let now = Self::wall_clock_timestamp();
 
-        if timestamp != now {
-            tracing::warn!(
-                now,
-                parent_timestamp,
-                adjusted_timestamp = timestamp,
-                "Adjusted block timestamp to be > parent (clock may be behind)"
-            );
+        match block_timing {
+            BlockTiming::Vanilla => now > parent_timestamp,
+            BlockTiming::Subsecond => now >= parent_timestamp,
         }
-
-        timestamp
     }
 
     /// Propose a new block using the vanilla Ethereum builder flow.
@@ -432,7 +441,19 @@ impl Application {
             }
         };
 
-        let timestamp = Self::compute_block_timestamp(parent_timestamp);
+        // Check if we can build based on timing mode
+        if !Self::can_build_block(self.block_timing, parent_timestamp) {
+            tracing::debug!(
+                height = self.height,
+                parent_timestamp,
+                block_timing = ?self.block_timing,
+                "Skipping proposal - waiting for timestamp to advance"
+            );
+            return commonware_cryptography::sha256::Digest(Self::NULL_PROPOSAL_DIGEST);
+        }
+
+        // Use actual wall clock - no artificial timestamp adjustment
+        let timestamp = Self::wall_clock_timestamp();
 
         // Build block via reth
         match self.execution.start_building(self.last_hash, timestamp, self.proposer).await {
@@ -568,13 +589,17 @@ impl Application {
             // CRITICAL: Verify block is at expected height to prevent duplicate finalizations.
             // When Simplex advances views quickly, multiple blocks can be proposed at the
             // same height before the first one is finalized. We must reject stale blocks.
+            //
+            // NOTE: In vanilla timing mode, this is EXPECTED behavior - multiple validators
+            // may propose blocks at the same height when the timestamp constraint first allows.
+            // Consensus finalizes one, the rest are correctly rejected here.
             if block.height() != self.height {
-                tracing::warn!(
+                tracing::debug!(
                     expected_height = self.height,
                     block_height = block.height(),
                     block_hash = %block.block_hash,
                     ?digest,
-                    "Rejecting stale block finalization - height mismatch"
+                    "Ignoring stale block finalization - already finalized a block at this height"
                 );
                 // Clean up the orphaned payload
                 self.pending_payloads.remove(&digest);
@@ -634,7 +659,11 @@ impl Application {
         } else {
             // Clean up orphaned payload if exists
             self.pending_payloads.remove(&digest);
-            tracing::warn!(?digest, "Attempted to finalize unknown block");
+            // NOTE: In vanilla timing mode, this can happen when multiple blocks are proposed
+            // at the same height. The first finalized block triggers cleanup of pending blocks
+            // at that height. Subsequent finalization attempts for those cleaned-up blocks
+            // arrive here. This is expected behavior, not an error.
+            tracing::debug!(?digest, "Ignoring finalization for already-cleaned-up block");
             None
         }
     }

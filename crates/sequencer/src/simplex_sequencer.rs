@@ -852,6 +852,7 @@ fn build_runtime_config(consensus: &ConsensusConfig, initial_hash: B256) -> Resu
         allow_private_ips: consensus.allow_private_ips,
         max_message_size: 1024 * 1024,
         initial_hash,
+        block_timing: consensus.block_timing,
     })
 }
 

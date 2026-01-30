@@ -5,6 +5,23 @@ use std::path::PathBuf;
 use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 
+/// Block timing mode for proposal generation.
+///
+/// Controls how the sequencer handles Ethereum's timestamp constraint
+/// (`block.timestamp > parent.timestamp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockTiming {
+    /// Vanilla Reth mode: Only propose when wall clock > parent timestamp.
+    /// Results in ~1 block per second. No Reth modifications needed.
+    #[default]
+    Vanilla,
+    /// Subsecond mode: Propose when wall clock >= parent timestamp.
+    /// Allows multiple blocks per second with same timestamp.
+    /// Requires forked Reth with relaxed timestamp validation.
+    Subsecond,
+}
+
 /// Default configuration values.
 ///
 /// All configuration defaults are centralized here for visibility and reuse in tests/docs.
@@ -181,6 +198,15 @@ pub struct ConsensusConfig {
     /// Allow private IPs for P2P (useful for local testing).
     #[serde(default = "default_allow_private_ips")]
     pub allow_private_ips: bool,
+
+    /// Block timing mode.
+    ///
+    /// - `vanilla`: Only build when timestamp can strictly advance (1s minimum blocks).
+    ///   Works with unmodified Reth. This is the default.
+    /// - `subsecond`: Allow same-second timestamps (sub-second blocks possible).
+    ///   Requires forked Reth with relaxed timestamp validation (`>=` instead of `>`).
+    #[serde(default)]
+    pub block_timing: BlockTiming,
 }
 
 /// Celestia DA configuration.

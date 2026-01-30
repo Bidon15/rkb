@@ -51,7 +51,7 @@ use commonware_runtime::{
 };
 use commonware_utils::{ordered::Set, union};
 use rand::{CryptoRng, RngCore};
-use sequencer_types::{Block, ConsensusConfig};
+use sequencer_types::{Block, BlockTiming, ConsensusConfig};
 
 use crate::application::{AppDigest, Application, ApplicationConfig, Mailbox, ProposedBlock};
 use crate::network::{backlog, channels, rate_limits};
@@ -124,6 +124,9 @@ pub struct SimplexRuntimeConfig {
     /// Initial block hash (parent of first block).
     /// Use B256::ZERO for genesis.
     pub initial_hash: B256,
+
+    /// Block timing mode (vanilla = 1s blocks, subsecond = <1s with forked Reth).
+    pub block_timing: BlockTiming,
 }
 
 impl SimplexRuntimeConfig {
@@ -159,6 +162,7 @@ impl SimplexRuntimeConfig {
             allow_private_ips: true,
             max_message_size: 1024 * 1024,
             initial_hash,
+            block_timing: chain_config.block_timing,
         }
     }
 
@@ -393,6 +397,7 @@ fn create_application(
         proposer: config.our_address,
         execution,
         mailbox_size: config.mailbox_size,
+        block_timing: config.block_timing,
     };
     Application::new(app_config)
 }
@@ -668,6 +673,7 @@ mod tests {
             allow_private_ips: true,
             max_message_size: 1024 * 1024,
             initial_hash: B256::ZERO,
+            block_timing: BlockTiming::Vanilla,
         }
     }
 

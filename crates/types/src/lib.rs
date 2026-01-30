@@ -10,7 +10,7 @@ pub mod serde_helpers;
 mod transaction;
 
 pub use block::{Block, BlockHash, BlockHeader, BlockParams, Signature};
-pub use config::{CelestiaConfig, ChainConfig, ConsensusConfig, ExecutionConfig};
+pub use config::{BlockTiming, CelestiaConfig, ChainConfig, ConsensusConfig, ExecutionConfig};
 pub use transaction::{Transaction, TransactionHash};
 
 /// Re-export commonly used types from alloy.

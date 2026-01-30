@@ -35,6 +35,11 @@ namespace = "rkb-sequencer"
 storage_dir = "/data/consensus"
 allow_private_ips = true
 
+# Block timing mode:
+# - "vanilla": 1s blocks, works with unmodified Reth (default)
+# - "subsecond": <1s blocks, requires forked Reth with relaxed timestamp validation
+block_timing = "vanilla"
+
 [celestia]
 # ------------------------------------------------------------------------------
 # Bridge Node (for reading blobs)

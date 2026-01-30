@@ -80,7 +80,7 @@ pub fn validate(config: &Config) -> Result<()> {
 /// Generate a default configuration.
 #[must_use]
 pub fn default_config() -> Config {
-    use sequencer_types::{CelestiaConfig, ConsensusConfig, ExecutionConfig};
+    use sequencer_types::{BlockTiming, CelestiaConfig, ConsensusConfig, ExecutionConfig};
 
     // Derive validator address from seed 0
     let validator_addr = derive_address(&ed25519::PrivateKey::from_seed(0).public_key());
@@ -102,6 +102,7 @@ pub fn default_config() -> Config {
             namespace: "rkb-sequencer".to_string(),
             storage_dir: "./consensus-data".into(),
             allow_private_ips: true,
+            block_timing: BlockTiming::Vanilla,
         },
         celestia: CelestiaConfig {
             bridge_addr: "http://localhost:26658".to_string(),
