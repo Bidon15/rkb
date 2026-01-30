@@ -47,6 +47,46 @@ struct SyncContext<'a> {
     index: &'a mut BlockIndex,
 }
 
+/// Context for block finalization (reduces Arc clone boilerplate).
+#[derive(Clone)]
+struct FinalizationContext {
+    execution: Arc<ExecutionClient>,
+    forkchoice: Arc<RwLock<ForkchoiceState>>,
+    celestia: Arc<CelestiaClient>,
+    executed_blocks: Arc<RwLock<HashSet<B256>>>,
+    batch_tx: Option<mpsc::Sender<Block>>,
+    batch_enabled: bool,
+}
+
+/// Mutable state for batch submission loop.
+struct BatchState {
+    pending_blocks: Vec<Block>,
+    pending_size: usize,
+}
+
+impl BatchState {
+    fn new() -> Self {
+        Self {
+            pending_blocks: Vec::with_capacity(64),
+            pending_size: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending_blocks.is_empty()
+    }
+}
+
+/// Action to take after processing a batch event.
+enum BatchAction {
+    /// Continue waiting for more blocks.
+    Continue,
+    /// Submit the current batch.
+    Submit,
+    /// Submit remaining blocks and exit.
+    Shutdown,
+}
+
 impl SimplexSequencer {
     /// Create a new Simplex sequencer.
     pub fn new(config: Config) -> Self {
@@ -385,53 +425,19 @@ impl SimplexSequencer {
         batch_tx: Option<mpsc::Sender<Block>>,
         batch_enabled: bool,
     ) -> impl OnFinalized {
+        let ctx = FinalizationContext {
+            execution,
+            forkchoice,
+            celestia,
+            executed_blocks,
+            batch_tx,
+            batch_enabled,
+        };
+
         on_finalized(move |block, is_leader| {
-            let execution = Arc::clone(&execution);
-            let forkchoice = Arc::clone(&forkchoice);
-            let executed_blocks = Arc::clone(&executed_blocks);
-            let batch_tx = batch_tx.clone();
-            let celestia = Arc::clone(&celestia);
-
+            let ctx = ctx.clone();
             async move {
-                let block_hash = block.block_hash;
-                let block_height = block.height();
-
-                // Execute block on reth
-                if let Err(e) = execute_and_update_forkchoice(
-                    &execution,
-                    &forkchoice,
-                    &block,
-                    block_hash,
-                    block_height,
-                )
-                .await
-                {
-                    error!(height = block_height, error = %e, "Block execution failed");
-                    return Ok(());
-                }
-
-                // Track this block as successfully executed and canonical.
-                // This allows finality confirmation to safely update the finalized pointer.
-                executed_blocks.write().await.insert(block_hash);
-
-                // Leader handles Celestia submission
-                if is_leader {
-                    submit_to_celestia(
-                        &celestia,
-                        batch_tx.as_ref(),
-                        batch_enabled,
-                        block,
-                        block_hash,
-                        block_height,
-                    )
-                    .await;
-                } else {
-                    info!(
-                        height = block_height,
-                        "Block finalized (not leader, skipping Celestia submission)"
-                    );
-                }
-
+                process_finalized_block(&ctx, block, is_leader).await;
                 Ok(())
             }
         })
@@ -543,41 +549,30 @@ async fn execute_sync_block(
     Ok(())
 }
 
-/// Result of handling a received block in the batch loop.
-enum BlockReceiveResult {
-    /// Block queued, not ready to submit yet.
-    Queued,
-    /// Batch size limit reached, should submit now.
-    BatchFull,
-    /// Channel closed, submit remaining and exit.
-    ChannelClosed,
-}
-
-/// Handle a received block, updating pending state.
+/// Handle a received block, updating batch state.
 fn handle_received_block(
     block: Option<Block>,
-    pending_blocks: &mut Vec<Block>,
-    pending_size: &mut usize,
+    state: &mut BatchState,
     max_batch_size_bytes: usize,
-) -> BlockReceiveResult {
+) -> BatchAction {
     let Some(block) = block else {
-        return BlockReceiveResult::ChannelClosed;
+        return BatchAction::Shutdown;
     };
 
     let block_size = estimate_block_size(&block);
-    pending_blocks.push(block);
-    *pending_size += block_size;
+    state.pending_blocks.push(block);
+    state.pending_size += block_size;
 
-    if *pending_size >= max_batch_size_bytes {
+    if state.pending_size >= max_batch_size_bytes {
         info!(
-            pending_size,
+            pending_size = state.pending_size,
             max_batch_size_bytes,
-            block_count = pending_blocks.len(),
+            block_count = state.pending_blocks.len(),
             "Batch size limit reached, submitting early"
         );
-        BlockReceiveResult::BatchFull
+        BatchAction::Submit
     } else {
-        BlockReceiveResult::Queued
+        BatchAction::Continue
     }
 }
 
@@ -588,34 +583,70 @@ async fn run_batch_submission_loop(
     batch_interval_ms: u64,
     max_batch_size_bytes: usize,
 ) {
-    let interval = Duration::from_millis(batch_interval_ms);
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(Duration::from_millis(batch_interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut pending_blocks: Vec<Block> = Vec::with_capacity(64);
-    let mut pending_size: usize = 0;
+    let mut state = BatchState::new();
 
     loop {
-        let should_submit = tokio::select! {
-            _ = ticker.tick() => !pending_blocks.is_empty(),
-            block = batch_rx.recv() => {
-                match handle_received_block(block, &mut pending_blocks, &mut pending_size, max_batch_size_bytes) {
-                    BlockReceiveResult::Queued => false,
-                    BlockReceiveResult::BatchFull => true,
-                    BlockReceiveResult::ChannelClosed => {
-                        if !pending_blocks.is_empty() {
-                            submit_batch(&celestia, &mut pending_blocks, &mut pending_size).await;
-                        }
-                        break;
-                    }
-                }
-            }
-        };
+        let action = wait_for_batch_event(&mut batch_rx, &mut ticker, &mut state, max_batch_size_bytes).await;
 
-        if should_submit {
-            submit_batch(&celestia, &mut pending_blocks, &mut pending_size).await;
-            ticker.reset();
+        match action {
+            BatchAction::Continue => {}
+            BatchAction::Submit => {
+                submit_batch(&celestia, &mut state).await;
+                ticker.reset();
+            }
+            BatchAction::Shutdown => {
+                submit_batch(&celestia, &mut state).await;
+                break;
+            }
         }
+    }
+}
+
+/// Wait for the next batch event and determine action.
+async fn wait_for_batch_event(
+    batch_rx: &mut mpsc::Receiver<Block>,
+    ticker: &mut tokio::time::Interval,
+    state: &mut BatchState,
+    max_batch_size_bytes: usize,
+) -> BatchAction {
+    tokio::select! {
+        _ = ticker.tick() => {
+            if state.is_empty() { BatchAction::Continue } else { BatchAction::Submit }
+        }
+        block = batch_rx.recv() => {
+            handle_received_block(block, state, max_batch_size_bytes)
+        }
+    }
+}
+
+/// Process a finalized block: execute, track, and optionally submit to Celestia.
+async fn process_finalized_block(ctx: &FinalizationContext, block: Block, is_leader: bool) {
+    let block_hash = block.block_hash;
+    let block_height = block.height();
+
+    if let Err(e) = execute_and_update_forkchoice(
+        &ctx.execution,
+        &ctx.forkchoice,
+        &block,
+        block_hash,
+        block_height,
+    )
+    .await
+    {
+        error!(height = block_height, error = %e, "Block execution failed");
+        return;
+    }
+
+    // Track as successfully executed (enables finality confirmation)
+    ctx.executed_blocks.write().await.insert(block_hash);
+
+    if is_leader {
+        submit_to_celestia(&ctx.celestia, ctx.batch_tx.as_ref(), ctx.batch_enabled, block, block_hash, block_height).await;
+    } else {
+        info!(height = block_height, "Block finalized (not leader, skipping Celestia submission)");
     }
 }
 
@@ -815,47 +846,53 @@ fn estimate_block_size(block: &Block) -> usize {
 }
 
 /// Submit a batch of blocks to Celestia.
-async fn submit_batch(
-    celestia: &CelestiaClient,
-    pending_blocks: &mut Vec<Block>,
-    pending_size: &mut usize,
-) {
-    let blocks = std::mem::take(pending_blocks);
-    *pending_size = 0;
+async fn submit_batch(celestia: &CelestiaClient, state: &mut BatchState) {
+    let blocks = std::mem::take(&mut state.pending_blocks);
+    state.pending_size = 0;
 
     if blocks.is_empty() {
         return;
     }
 
+    log_batch_submission(&blocks);
+
+    match celestia.submit_blocks(&blocks).await {
+        Ok(submissions) => log_batch_success(celestia, submissions),
+        Err(e) => restore_failed_batch(state, blocks, &e),
+    }
+}
+
+/// Log batch submission start.
+fn log_batch_submission(blocks: &[Block]) {
     info!(
         block_count = blocks.len(),
         first_height = blocks.first().map(Block::height),
         last_height = blocks.last().map(Block::height),
         "Submitting block batch to Celestia"
     );
+}
 
-    match celestia.submit_blocks(&blocks).await {
-        Ok(submissions) => {
-            for submission in submissions {
-                info!(
-                    block_height = submission.block_height,
-                    celestia_height = submission.celestia_height,
-                    "Block submitted to Celestia"
-                );
-                celestia.track_finality(submission.block_hash, submission);
-            }
-        }
-        Err(e) => {
-            error!(
-                error = %e,
-                block_count = blocks.len(),
-                "Failed to submit block batch to Celestia"
-            );
-            // Re-add blocks to pending for retry on next interval
-            *pending_blocks = blocks;
-            *pending_size = pending_blocks.iter().map(estimate_block_size).sum();
-        }
+/// Log successful batch submission and track finality.
+fn log_batch_success(celestia: &CelestiaClient, submissions: Vec<sequencer_celestia::BlobSubmission>) {
+    for submission in submissions {
+        info!(
+            block_height = submission.block_height,
+            celestia_height = submission.celestia_height,
+            "Block submitted to Celestia"
+        );
+        celestia.track_finality(submission.block_hash, submission);
     }
+}
+
+/// Restore blocks to state after failed submission for retry.
+fn restore_failed_batch(state: &mut BatchState, blocks: Vec<Block>, error: &sequencer_celestia::CelestiaError) {
+    error!(
+        error = %error,
+        block_count = blocks.len(),
+        "Failed to submit block batch to Celestia"
+    );
+    state.pending_size = blocks.iter().map(estimate_block_size).sum();
+    state.pending_blocks = blocks;
 }
 
 // =============================================================================
