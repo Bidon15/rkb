@@ -1,0 +1,190 @@
+# 3-Validator PoA Sequencer Network with ethrex (Subsecond Blocks)
+#
+# This setup uses forked ethrex with relaxed timestamp validation for subsecond blocks.
+# Requires: ethrex:latest image built from forked repo with timestamp changes.
+#
+# Architecture: Users send transactions directly to ethrex (not sequencer)
+#
+#   User tx --> ethrex mempool --> sequencer orchestrates --> Celestia DA
+#                 (8545)            (consensus)              (finality)
+#
+# Subsecond Mode:
+#   - ethrex has relaxed timestamp validation (>= instead of >)
+#   - Enables ~33ms blocks instead of 1s blocks
+#   - Config: block_timing = "subsecond"
+#
+# Usage:
+#   1. Build ethrex:     (in ethrex repo) docker build -t ethrex:latest .
+#   2. Generate keys:    ../scripts/generate-keys.sh
+#   3. Start network:    docker compose up -d
+#   4. Connect peers:    ../scripts/connect-ethrex-peers.sh
+#   5. Send tx:          cast send --rpc-url http://localhost:8545 ...
+
+services:
+  # ============================================
+  # Validator 0 (seed=0)
+  # ============================================
+  validator-0:
+    image: rkb:latest
+    container_name: validator-0
+    volumes:
+      - ./config/validator-0:/config:ro
+      - ../keys/validator-0.key:/keys/validator.key:ro
+      - ../keys/celestia-0.key:/keys/celestia.key:ro
+      - ../keys/jwt-0.hex:/keys/jwt.hex:ro
+      - validator-0-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=info
+    ports:
+      - "26656:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      ethrex-0:
+        condition: service_started
+    command: ["run", "--config", "/config/config.toml"]
+
+  ethrex-0:
+    image: ethrex:latest
+    container_name: ethrex-0
+    volumes:
+      - ethrex-0-data:/data
+      - ../keys/jwt-0.hex:/jwt.hex:ro
+      - ./genesis.json:/genesis.json:ro
+    ports:
+      - "8545:8545"   # JSON-RPC - send transactions here
+      - "30303:30303" # P2P - for tx gossip
+      - "30303:30303/udp"
+    networks:
+      - sequencer-net
+    command:
+      - --network=/genesis.json
+      - --datadir=/data
+      - --syncmode=full
+      # JSON-RPC for user transactions
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      # Engine API for consensus
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      # P2P networking for tx gossip
+      - --p2p.addr=0.0.0.0
+      - --p2p.port=30303
+      - --discovery.port=30303
+
+  # ============================================
+  # Validator 1 (seed=1)
+  # ============================================
+  validator-1:
+    image: rkb:latest
+    container_name: validator-1
+    volumes:
+      - ./config/validator-1:/config:ro
+      - ../keys/validator-1.key:/keys/validator.key:ro
+      - ../keys/celestia-1.key:/keys/celestia.key:ro
+      - ../keys/jwt-1.hex:/keys/jwt.hex:ro
+      - validator-1-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=info
+    ports:
+      - "26657:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      ethrex-1:
+        condition: service_started
+    command: ["run", "--config", "/config/config.toml"]
+
+  ethrex-1:
+    image: ethrex:latest
+    container_name: ethrex-1
+    volumes:
+      - ethrex-1-data:/data
+      - ../keys/jwt-1.hex:/jwt.hex:ro
+      - ./genesis.json:/genesis.json:ro
+    ports:
+      - "8546:8545"   # JSON-RPC (alternate)
+      - "30304:30303" # P2P - for tx gossip
+      - "30304:30303/udp"
+    networks:
+      - sequencer-net
+    command:
+      - --network=/genesis.json
+      - --datadir=/data
+      - --syncmode=full
+      # JSON-RPC for user transactions
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      # Engine API for consensus
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      # P2P networking for tx gossip
+      - --p2p.addr=0.0.0.0
+      - --p2p.port=30303
+      - --discovery.port=30303
+
+  # ============================================
+  # Validator 2 (seed=2)
+  # ============================================
+  validator-2:
+    image: rkb:latest
+    container_name: validator-2
+    volumes:
+      - ./config/validator-2:/config:ro
+      - ../keys/validator-2.key:/keys/validator.key:ro
+      - ../keys/celestia-2.key:/keys/celestia.key:ro
+      - ../keys/jwt-2.hex:/keys/jwt.hex:ro
+      - validator-2-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=info
+    ports:
+      - "26658:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      ethrex-2:
+        condition: service_started
+    command: ["run", "--config", "/config/config.toml"]
+
+  ethrex-2:
+    image: ethrex:latest
+    container_name: ethrex-2
+    volumes:
+      - ethrex-2-data:/data
+      - ../keys/jwt-2.hex:/jwt.hex:ro
+      - ./genesis.json:/genesis.json:ro
+    ports:
+      - "8547:8545"   # JSON-RPC (alternate)
+      - "30305:30303" # P2P - for tx gossip
+      - "30305:30303/udp"
+    networks:
+      - sequencer-net
+    command:
+      - --network=/genesis.json
+      - --datadir=/data
+      - --syncmode=full
+      # JSON-RPC for user transactions
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      # Engine API for consensus
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      # P2P networking for tx gossip
+      - --p2p.addr=0.0.0.0
+      - --p2p.port=30303
+      - --discovery.port=30303
+
+networks:
+  sequencer-net:
+    driver: bridge
+
+volumes:
+  validator-0-data:
+  validator-1-data:
+  validator-2-data:
+  ethrex-0-data:
+  ethrex-1-data:
+  ethrex-2-data:

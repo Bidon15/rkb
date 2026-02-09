@@ -2,40 +2,108 @@
 
 3-validator PoA network using Simplex BFT consensus with Celestia DA.
 
-## Key Insight: Transactions Go to reth
+## Choose Your Execution Client
+
+| Setup | Block Time | Client | Use Case |
+|-------|------------|--------|----------|
+| **[reth/](reth/)** | ~1 second | Vanilla Reth | Stability, standard Ethereum compatibility |
+| **[ethrex/](ethrex/)** | ~33ms | Forked ethrex | Speed, sub-second confirmations |
+
+See [block-timing-explained.md](../docs/block-timing-explained.md) for why this matters.
+
+## Key Insight: Transactions Go to the Execution Client
 
 ```
-Users ──► reth JSON-RPC (port 8545) ──► reth mempool ──► sequencer builds blocks
+Users --> Execution Client (port 8545) --> mempool --> sequencer builds blocks
 ```
 
-**You don't send transactions to the sequencer.** Send them directly to any reth instance using standard Ethereum tooling (`eth_sendRawTransaction`). The sequencer has no mempool—it orchestrates reth, which handles all transaction management.
+**You don't send transactions to the sequencer.** Send them directly to any execution client instance using standard Ethereum tooling (`eth_sendRawTransaction`). The sequencer has no mempool—it orchestrates execution, which handles all transaction management.
 
 ## Quick Start
+
+### Option 1: Vanilla Reth (1s blocks)
 
 ```bash
 cd docker
 
-# 1. Generate keys
+# 1. Generate keys (shared by both setups)
 ./scripts/generate-keys.sh
 
-# 2. Get Celestia addresses (build first)
+# 2. Fund Celestia accounts (see below)
+
+# 3. Start network
+cd reth
+docker compose up -d
+
+# 4. Watch logs
+docker compose logs -f
+```
+
+### Option 2: Forked ethrex (subsecond blocks)
+
+```bash
+cd docker
+
+# 1. Generate keys (shared by both setups)
+./scripts/generate-keys.sh
+
+# 2. Build ethrex (from your ethrex fork with timestamp changes)
+# cd /path/to/ethrex && docker build -t ethrex:latest .
+
+# 3. Fund Celestia accounts (see below)
+
+# 4. Start network
+cd ethrex
+docker compose up -d
+
+# 5. (Optional) Connect ethrex peers for tx gossip
+../scripts/connect-ethrex-peers.sh
+
+# 6. Watch logs
+docker compose logs -f
+```
+
+### Fund ALL THREE Celestia Accounts
+
+Each validator needs its own funded Celestia account because any validator can become leader:
+
+```bash
 cargo build --release -p sequencer
 ../target/release/sequencer celestia-address --key keys/celestia-0.key
 ../target/release/sequencer celestia-address --key keys/celestia-1.key
 ../target/release/sequencer celestia-address --key keys/celestia-2.key
+```
 
-# 3. Fund ALL THREE addresses at https://faucet.celestia-mocha.com/
+Fund all 3 at: https://faucet.celestia-mocha.com/
 
-# 4. Build and run
-docker compose up -d --build
+## Directory Structure
 
-# 5. Watch logs
-docker compose logs -f
+```
+docker/
+├── reth/                    # Vanilla Reth setup (1s blocks)
+│   ├── config/validator-*/  # Validator configs (block_timing = "vanilla")
+│   ├── docker-compose.yml   # Uses reth:v1.3.12
+│   └── genesis.json         # Standard format
+│
+├── ethrex/                  # Forked ethrex setup (subsecond blocks)
+│   ├── config/validator-*/  # Validator configs (block_timing = "subsecond")
+│   ├── docker-compose.yml   # Uses ethrex:latest
+│   └── genesis.json         # Has depositContractAddress
+│
+├── keys/                    # Shared keys (generated once)
+│   ├── validator-*.key      # Ed25519 consensus keys
+│   ├── celestia-*.key       # secp256k1 Celestia keys
+│   └── jwt-*.hex            # JWT secrets for Engine API
+│
+└── scripts/                 # Shared scripts
+    ├── generate-keys.sh     # Key generation
+    ├── connect-reth-peers.sh
+    └── connect-ethrex-peers.sh
 ```
 
 ## Sending Transactions
 
-Send transactions to **any reth instance** using standard Ethereum tools:
+Send transactions to **any execution client instance** using standard Ethereum tools:
 
 ```bash
 # Using cast (foundry)
@@ -56,93 +124,24 @@ cast balance --rpc-url http://localhost:8545 <ADDRESS>
 cast block-number --rpc-url http://localhost:8545
 ```
 
-**Why reth, not sequencer?**
-- reth has a production-grade mempool (we wrote 0 lines)
-- reth handles nonce ordering, gas price priority (we wrote 0 lines)
-- reth validates transactions before inclusion (we wrote 0 lines)
-- Standard Ethereum tooling just works
+## Ports
 
-## Testing the Network
+| Service | Host Port | Description |
+|---------|-----------|-------------|
+| reth-0 / ethrex-0 | 8545 | **JSON-RPC (send transactions here)** |
+| reth-1 / ethrex-1 | 8546 | JSON-RPC (alternate) |
+| reth-2 / ethrex-2 | 8547 | JSON-RPC (alternate) |
+| validator-0 | 26656 | P2P consensus |
+| validator-1 | 26657 | P2P consensus |
+| validator-2 | 26658 | P2P consensus |
 
-### Verify Validators Connect
-
-```bash
-# Check P2P connections (should see 2 peers)
-docker compose logs validator-0 | grep -i "peer"
-
-# Check consensus is running
-docker compose logs validator-0 | grep -i "leader\|proposal\|notari"
-```
-
-### Watch Block Production
-
-```bash
-# See block execution
-docker compose logs -f | grep -E "height|executed|finalized"
-
-# Check specific validator
-docker compose logs -f validator-0 | grep "Block"
-```
-
-### Check Celestia Submissions
-
-```bash
-# Watch batch submissions (every 5 seconds by default)
-docker compose logs -f | grep -i "celestia\|batch\|submit"
-
-# Successful submission looks like:
-# "Submitting block batch to Celestia"
-# "Block submitted to Celestia"
-# "Block finalized on Celestia"
-```
-
-### Check reth (EVM) Status
-
-```bash
-# View reth logs
-docker compose logs reth-0
-
-# Check Engine API is working
-docker compose logs validator-0 | grep -i "engine\|payload\|forkchoice"
-```
-
-### View Current State
-
-```bash
-# Count finalized blocks
-docker compose logs validator-0 | grep "Block finalized" | wc -l
-
-# Check latest block height
-docker compose logs validator-0 | grep "height" | tail -5
-```
-
-## Configuration
-
-### Batch Settings
-
-In `config/validator-*/config.toml`:
-
-```toml
-[celestia]
-# Submit every 5 seconds
-batch_interval_ms = 5000
-
-# Or submit early if batch exceeds 1.5MB
-max_batch_size_bytes = 1500000
-```
-
-### Consensus Timing
-
-```toml
-[consensus]
-leader_timeout_ms = 2000       # Wait for leader proposal
-notarization_timeout_ms = 3000 # Wait for 2/3 votes
-nullify_retry_ms = 10000       # Retry on failed rounds
-```
+Engine API ports (8551) are internal only.
 
 ## Commands
 
 ```bash
+# From reth/ or ethrex/ directory:
+
 # Logs
 docker compose logs -f
 docker compose logs -f validator-0
@@ -162,53 +161,28 @@ docker compose up -d --build
 ### "Celestia submission failed"
 
 - Verify all 3 Celestia accounts are funded
-- Check: `../target/release/sequencer celestia-address --key keys/celestia-0.key`
+- Check: `../target/release/sequencer celestia-address --key ../keys/celestia-0.key`
 - Get tokens: https://faucet.celestia-mocha.com/
 
 ### "Failed to execute block"
 
-- Check reth is running: `docker compose logs reth-0`
+- Check execution client is running: `docker compose logs reth-0` or `docker compose logs ethrex-0`
 - Verify JWT auth: `docker compose logs validator-0 | grep -i jwt`
+
+### ethrex "SYNCING" status
+
+- Ensure `--syncmode=full` is set (already configured in ethrex/docker-compose.yml)
+- The default "snap" mode returns SYNCING for private networks
 
 ### Validators Not Connecting
 
-- Check network: `docker network inspect docker_sequencer-net`
+- Check network: `docker network inspect <project>_sequencer-net`
 - Verify peers in config match container names
 
 ### No Blocks Being Produced
 
 - Need 2/3 validators (2 of 3) for consensus
 - Check all 3 are running: `docker compose ps`
-
-## Structure
-
-```
-docker/
-├── config/
-│   ├── validator-0/config.toml
-│   ├── validator-1/config.toml
-│   └── validator-2/config.toml
-├── keys/                  # Generated, gitignored
-├── scripts/
-│   └── generate-keys.sh
-├── genesis.json           # reth genesis (EVM chain config)
-├── docker-compose.yml
-├── Dockerfile
-└── README.md
-```
-
-## Ports
-
-| Service | Host Port | Description |
-|---------|-----------|-------------|
-| reth-0 | 8545 | **JSON-RPC (send transactions here)** |
-| reth-1 | 8546 | JSON-RPC (alternate) |
-| reth-2 | 8547 | JSON-RPC (alternate) |
-| validator-0 | 26656 | P2P consensus |
-| validator-1 | 26657 | P2P consensus |
-| validator-2 | 26658 | P2P consensus |
-
-Engine API ports (8551) are internal only—validators use them to communicate with their reth instances.
 
 ---
 

@@ -1,0 +1,177 @@
+# 3-Validator PoA Sequencer Network with Reth (Vanilla 1s Blocks)
+#
+# This setup uses standard Reth with vanilla block timing (1s minimum).
+# Use this for compatibility with unmodified Ethereum execution clients.
+#
+# Architecture: Users send transactions directly to Reth (not sequencer)
+#
+#   User tx --> Reth mempool --> sequencer orchestrates --> Celestia DA
+#                 (8545)            (consensus)              (finality)
+#
+# Usage:
+#   1. Generate keys:    ../scripts/generate-keys.sh
+#   2. Start network:    docker compose up -d
+#   3. Send tx:          cast send --rpc-url http://localhost:8545 ...
+
+services:
+  # ============================================
+  # Validator 0 (seed=0)
+  # ============================================
+  validator-0:
+    image: rkb:latest
+    container_name: validator-0
+    volumes:
+      - ./config/validator-0:/config:ro
+      - ../keys/validator-0.key:/keys/validator.key:ro
+      - ../keys/celestia-0.key:/keys/celestia.key:ro
+      - ../keys/jwt-0.hex:/keys/jwt.hex:ro
+      - validator-0-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=info
+    ports:
+      - "26656:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      reth-0:
+        condition: service_started
+    command: ["run", "--config", "/config/config.toml"]
+
+  reth-0:
+    image: ghcr.io/paradigmxyz/reth:v1.3.12
+    container_name: reth-0
+    volumes:
+      - reth-0-data:/data
+      - ../keys/jwt-0.hex:/jwt.hex:ro
+      - ./genesis.json:/genesis.json:ro
+    ports:
+      - "8545:8545"   # JSON-RPC - send transactions here
+      - "30303:30303" # P2P
+      - "30303:30303/udp"
+    networks:
+      - sequencer-net
+    command:
+      - node
+      - --chain=/genesis.json
+      - --datadir=/data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3,txpool,debug,trace
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      - --port=30303
+      - --discovery.port=30303
+
+  # ============================================
+  # Validator 1 (seed=1)
+  # ============================================
+  validator-1:
+    image: rkb:latest
+    container_name: validator-1
+    volumes:
+      - ./config/validator-1:/config:ro
+      - ../keys/validator-1.key:/keys/validator.key:ro
+      - ../keys/celestia-1.key:/keys/celestia.key:ro
+      - ../keys/jwt-1.hex:/keys/jwt.hex:ro
+      - validator-1-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=info
+    ports:
+      - "26657:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      reth-1:
+        condition: service_started
+    command: ["run", "--config", "/config/config.toml"]
+
+  reth-1:
+    image: ghcr.io/paradigmxyz/reth:v1.3.12
+    container_name: reth-1
+    volumes:
+      - reth-1-data:/data
+      - ../keys/jwt-1.hex:/jwt.hex:ro
+      - ./genesis.json:/genesis.json:ro
+    ports:
+      - "8546:8545"   # JSON-RPC (alternate)
+      - "30304:30303" # P2P
+      - "30304:30303/udp"
+    networks:
+      - sequencer-net
+    command:
+      - node
+      - --chain=/genesis.json
+      - --datadir=/data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3,txpool,debug,trace
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      - --port=30303
+      - --discovery.port=30303
+
+  # ============================================
+  # Validator 2 (seed=2)
+  # ============================================
+  validator-2:
+    image: rkb:latest
+    container_name: validator-2
+    volumes:
+      - ./config/validator-2:/config:ro
+      - ../keys/validator-2.key:/keys/validator.key:ro
+      - ../keys/celestia-2.key:/keys/celestia.key:ro
+      - ../keys/jwt-2.hex:/keys/jwt.hex:ro
+      - validator-2-data:/data
+    environment:
+      - RUST_LOG=info,sequencer=info
+    ports:
+      - "26658:26656"  # P2P
+    networks:
+      - sequencer-net
+    depends_on:
+      reth-2:
+        condition: service_started
+    command: ["run", "--config", "/config/config.toml"]
+
+  reth-2:
+    image: ghcr.io/paradigmxyz/reth:v1.3.12
+    container_name: reth-2
+    volumes:
+      - reth-2-data:/data
+      - ../keys/jwt-2.hex:/jwt.hex:ro
+      - ./genesis.json:/genesis.json:ro
+    ports:
+      - "8547:8545"   # JSON-RPC (alternate)
+      - "30305:30303" # P2P
+      - "30305:30303/udp"
+    networks:
+      - sequencer-net
+    command:
+      - node
+      - --chain=/genesis.json
+      - --datadir=/data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3,txpool,debug,trace
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      - --port=30303
+      - --discovery.port=30303
+
+networks:
+  sequencer-net:
+    driver: bridge
+
+volumes:
+  validator-0-data:
+  validator-1-data:
+  validator-2-data:
+  reth-0-data:
+  reth-1-data:
+  reth-2-data:

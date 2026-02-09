@@ -1,7 +1,5 @@
-# Validator 2 Configuration
+# Validator 2 Configuration (ethrex - Subsecond Timing)
 # Seed: 2
-#
-# Copy this file to config.toml and fill in your Celestia endpoints.
 
 chain_id = 1337
 
@@ -29,7 +27,7 @@ notarization_timeout_ms = 3000
 nullify_retry_ms = 10000
 
 # Namespace for signing
-namespace = "rkb-sequencer"
+namespace = "astria-sequencer"
 
 # Storage
 storage_dir = "/data/consensus"
@@ -37,32 +35,30 @@ allow_private_ips = true
 
 # Block timing mode:
 # - "vanilla": 1s blocks, works with unmodified Reth (default)
-# - "subsecond": <1s blocks, requires forked Reth with relaxed timestamp validation
-block_timing = "vanilla"
+# - "subsecond": <1s blocks, requires forked execution client (ethrex)
+block_timing = "subsecond"
 
 [celestia]
 # ------------------------------------------------------------------------------
 # Bridge Node (for reading blobs)
 # ------------------------------------------------------------------------------
-# Replace with your Celestia node RPC endpoint
-bridge_addr = "https://your-celestia-node.example.com/"
+bridge_addr = "https://young-weathered-scion.celestia-mocha.quiknode.pro/2ae91d0d78ef0a253990449d0bb7e9f054f024c0/"
 bridge_auth_token = ""
 bridge_tls_enabled = false
 
 # ------------------------------------------------------------------------------
 # Core gRPC (for submitting blobs)
 # ------------------------------------------------------------------------------
-# Replace with your Celestia node gRPC endpoint
-core_grpc_addr = "your-celestia-node.example.com:9090"
-core_grpc_auth_token = "your-auth-token-here"
+core_grpc_addr = "young-weathered-scion.celestia-mocha.quiknode.pro:9090"
+core_grpc_auth_token = "2ae91d0d78ef0a253990449d0bb7e9f054f024c0"
 core_grpc_tls_enabled = true
 
 # Celestia signing key
 celestia_key_path = "/keys/celestia.key"
 
 # Namespace (hex-encoded suffix, max 10 bytes - auto-padded by Celestia)
-# "rkb" in hex = 726b62
-namespace = "726b62"
+# "astria" in hex = 617374726961
+namespace = "617374726961"
 
 # Gas price
 gas_price = 0.04
@@ -90,6 +86,6 @@ genesis_da_height = 0
 index_path = "/data/celestia-index"
 
 [execution]
-# reth Engine API
-reth_url = "http://reth-2:8551"
+# ethrex Engine API (forked with relaxed timestamp validation)
+reth_url = "http://ethrex-2:8551"
 jwt_secret_path = "/keys/jwt.hex"
