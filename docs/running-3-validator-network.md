@@ -2,6 +2,15 @@
 
 This guide walks you through running a 3-validator Simplex BFT network locally using Docker Compose.
 
+## Choose Your Setup
+
+| Setup | Block Time | Execution Client | Use Case |
+|-------|------------|------------------|----------|
+| **docker/reth/** | ~1 second | Vanilla Reth | Stability, standard Ethereum |
+| **docker/ethrex/** | ~33ms | Forked ethrex | Speed, sub-second confirmations |
+
+See [block-timing-explained.md](block-timing-explained.md) for technical details.
+
 ## Architecture
 
 ```
@@ -15,10 +24,11 @@ This guide walks you through running a 3-validator Simplex BFT network locally u
 │  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘            │
 │         │                  │                  │                      │
 │    ┌────▼────┐        ┌────▼────┐        ┌────▼────┐               │
-│    │ reth-0  │        │ reth-1  │        │ reth-2  │               │
+│    │ exec-0  │        │ exec-1  │        │ exec-2  │               │
 │    │ (EVM)   │        │ (EVM)   │        │ (EVM)   │               │
 │    └─────────┘        └─────────┘        └─────────┘               │
 │                                                                      │
+│    exec-N = reth (vanilla) or ethrex (subsecond)                    │
 │                    P2P Mesh (commonware-p2p)                        │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -34,6 +44,7 @@ This guide walks you through running a 3-validator Simplex BFT network locally u
 - Docker and Docker Compose
 - ~8GB RAM available
 - Internet access (for Celestia Mocha testnet)
+- For ethrex setup: `ethrex:latest` image built from forked repo
 
 ## Quick Start
 
@@ -70,18 +81,34 @@ cargo build --release -p sequencer
 
 ### 3. Start the Network
 
+**Option A: Vanilla Reth (1s blocks)**
 ```bash
-docker compose up -d --build
+cd docker/reth
+docker compose up -d
+```
+
+**Option B: Forked ethrex (subsecond blocks)**
+```bash
+# First, build ethrex:latest from your fork
+cd /path/to/ethrex
+docker build -t ethrex:latest .
+
+# Then start the network
+cd /path/to/rkb/docker/ethrex
+docker compose up -d
+
+# (Optional) Connect ethrex peers for tx gossip
+../scripts/connect-ethrex-peers.sh
 ```
 
 This starts:
 - 3 sequencer validators
-- 3 reth instances
+- 3 execution client instances (reth or ethrex)
 
 ### 4. Check Logs
 
 ```bash
-# All validators
+# All validators (from reth/ or ethrex/ directory)
 docker compose logs -f
 
 # Specific validator
@@ -91,6 +118,7 @@ docker compose logs -f validator-0
 ### 5. Stop the Network
 
 ```bash
+# From reth/ or ethrex/ directory
 docker compose down
 
 # To also remove volumes (data):
@@ -101,11 +129,21 @@ docker compose down -v
 
 ### Block Production Timeline
 
+**ethrex (subsecond mode):**
+```
+Time 0ms:     Leader proposes block
+Time ~30ms:   2/3 validators vote → block notarized (soft finality)
+Time ~50ms:   Block executed on ethrex, forkchoice updated
+Time 5000ms:  Batch of ~150 blocks submitted to Celestia
+Time ~6s:     Celestia includes blob → firm finality
+```
+
+**Reth (vanilla mode):**
 ```
 Time 0ms:     Leader proposes block
 Time ~100ms:  2/3 validators vote → block notarized (soft finality)
 Time ~200ms:  Block executed on reth, forkchoice updated
-Time 5000ms:  Batch of ~25-50 blocks submitted to Celestia
+Time 5000ms:  Batch of ~5 blocks submitted to Celestia
 Time ~6s:     Celestia includes blob → firm finality
 ```
 
@@ -131,7 +169,7 @@ docker compose logs -f | grep -i "batch"
 # "Block finalized on Celestia"
 ```
 
-### Verify reth Execution
+### Verify Execution Client
 
 ```bash
 # Check Engine API calls
@@ -141,6 +179,10 @@ docker compose logs -f validator-0 | grep -i "payload\|forkchoice"
 # "Executing block via Engine API"
 # "Block executed"
 # "Forkchoice updated with Celestia finality"
+
+# Check execution client logs
+docker compose logs reth-0    # for reth setup
+docker compose logs ethrex-0  # for ethrex setup
 ```
 
 ### Check Network Health
@@ -158,7 +200,18 @@ docker compose logs validator-0 | grep "Block executed" | wc -l
 
 ## Configuration
 
-Each validator has its own config in `docker/config/validator-N/config.toml`.
+Each validator has its own config:
+- **Reth setup:** `docker/reth/config/validator-N/config.toml`
+- **ethrex setup:** `docker/ethrex/config/validator-N/config.toml`
+
+### Block Timing Mode
+
+```toml
+[consensus]
+# "vanilla" - 1s blocks, works with unmodified Reth
+# "subsecond" - ~33ms blocks, requires forked ethrex
+block_timing = "vanilla"  # or "subsecond"
+```
 
 ### Consensus Timing
 
@@ -270,16 +323,24 @@ docker network inspect docker_sequencer-net
    docker compose logs validator-0 | grep -i "celestia\|submit\|failed"
    ```
 
-### reth Not Starting
+### Execution Client Not Starting
 
 ```bash
 # Check JWT secret matches
 cat docker/keys/jwt-0.hex
-docker compose logs reth-0 | grep -i "jwt\|auth"
+docker compose logs reth-0 | grep -i "jwt\|auth"    # reth
+docker compose logs ethrex-0 | grep -i "jwt\|auth"  # ethrex
 
 # Check genesis loaded
-docker compose logs reth-0 | grep -i "genesis\|chain"
+docker compose logs reth-0 | grep -i "genesis\|chain"    # reth
+docker compose logs ethrex-0 | grep -i "genesis\|chain"  # ethrex
 ```
+
+### ethrex Returning "SYNCING" Status
+
+If validators show `ForkchoiceFailed("reth is syncing")`:
+- Ensure `--syncmode=full` is set in docker-compose.yml (default "snap" returns SYNCING)
+- The ethrex/docker-compose.yml already includes this fix
 
 ### No Blocks Being Produced
 
@@ -315,11 +376,13 @@ To change the number of validators:
 
 | Service | Port | Description |
 |---------|------|-------------|
-| validator-0 | 26656 | P2P |
-| validator-1 | 26657 | P2P |
-| validator-2 | 26658 | P2P |
-| reth-0 | 8545 (internal) | JSON-RPC |
-| reth-0 | 8551 (internal) | Engine API |
+| validator-0 | 26656 | P2P consensus |
+| validator-1 | 26657 | P2P consensus |
+| validator-2 | 26658 | P2P consensus |
+| reth-0 / ethrex-0 | 8545 | JSON-RPC (send transactions here) |
+| reth-1 / ethrex-1 | 8546 | JSON-RPC (alternate) |
+| reth-2 / ethrex-2 | 8547 | JSON-RPC (alternate) |
+| (internal) | 8551 | Engine API |
 
 ## Security Notes
 

@@ -184,25 +184,65 @@ This is not a novel approach. Major L2s do the same thing:
 | **Optimism** | op-geth | Allows `>=` for L2 blocks |
 | **Arbitrum** | nitro | Custom timestamp handling |
 | **Rollkit** | ev-reth | Allows `>=` for sovereign rollups |
+| **RKB** | ethrex | Allows `>=` for subsecond blocks |
 
 RKB's approach is identical to what these production systems use.
+
+### ethrex Fork Details
+
+RKB uses a forked [ethrex](https://github.com/lambdaclass/ethrex) client with two small changes:
+
+1. **Block validation** (`crates/common/types/block.rs`):
+   ```rust
+   // Change <= to <
+   if header.timestamp < parent_header.timestamp {
+       return Err(InvalidBlockHeaderError::TimestampLessThanParent);
+   }
+   ```
+
+2. **Engine API validation** (`crates/networking/rpc/engine/fork_choice.rs`):
+   ```rust
+   // Change <= to <
+   if attributes.timestamp < head_block.timestamp {
+       return Err(RpcErr::InvalidPayloadAttributes("invalid timestamp".to_string()));
+   }
+   ```
+
+Total: ~10 lines changed.
 
 ---
 
 ## Configuration
 
-RKB supports both approaches via a single config option:
+RKB provides separate Docker setups for each approach:
+
+```
+docker/
+├── reth/      # Vanilla Reth (1s blocks)
+│   └── config/validator-*/config.toml  # block_timing = "vanilla"
+│
+└── ethrex/    # Forked ethrex (subsecond blocks)
+    └── config/validator-*/config.toml  # block_timing = "subsecond"
+```
+
+### Config Option
 
 ```toml
 [consensus]
-# "vanilla" - 1s blocks, works with unmodified Reth (default)
-# "subsecond" - <1s blocks, requires forked Reth
-block_timing = "vanilla"
+# "vanilla" - 1s blocks, works with unmodified Reth
+# "subsecond" - ~33ms blocks, requires forked ethrex
+block_timing = "vanilla"  # or "subsecond"
 ```
 
-Switch between modes by:
-1. Changing the config value
-2. Using the appropriate Reth binary (vanilla or forked)
+### Switching Modes
+
+```bash
+# For vanilla Reth (1s blocks):
+cd docker/reth && docker compose up -d
+
+# For forked ethrex (subsecond blocks):
+cd docker/ethrex && docker compose up -d
+```
 
 ---
 
@@ -253,16 +293,16 @@ You're not rewriting the execution client. You're changing one comparison operat
 │                                                                 │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  VANILLA RETH                    FORKED RETH                    │
-│  ───────────                     ──────────                     │
+│  VANILLA RETH (docker/reth/)     FORKED ETHREX (docker/ethrex/) │
+│  ───────────────────────────     ────────────────────────────── │
 │                                                                 │
 │  Keep: timestamp > parent        Change to: timestamp >= parent │
-│  Result: 1 block/second          Result: 5+ blocks/second       │
+│  Result: 1 block/second          Result: ~30 blocks/second      │
 │  Drift: Zero                     Drift: Zero                    │
 │  Maintenance: None               Maintenance: Track upstream    │
 │                                                                 │
 │  Best for:                       Best for:                      │
-│  - Stability                     - Speed                        │
+│  - Stability                     - Speed (~33ms blocks)         │
 │  - Simplicity                    - Low latency UX               │
 │  - Getting started               - Production L2s               │
 │                                                                 │
